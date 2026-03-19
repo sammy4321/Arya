@@ -145,7 +145,6 @@ class UIParserService {
   /// returned with coordinates converted to region-relative values.
   Future<List<UIElement>> parseScreen({
     CaptureRegion? region,
-    int maxElements = 200,
     int? targetPid,
   }) async {
     if (!Platform.isMacOS) return [];
@@ -168,9 +167,6 @@ class UIParserService {
       }
 
       elements.sort(_interactivePriority);
-      if (elements.length > maxElements) {
-        elements = elements.sublist(0, maxElements);
-      }
 
       // Re-assign sequential IDs after filtering.
       elements = [
@@ -280,8 +276,8 @@ class UIParserService {
     }
 
     final cacheDir = '${Directory.systemTemp.path}/arya_ui_parser';
-    final binaryPath = '$cacheDir/ui_parser_v5';
-    final sourcePath = '$cacheDir/ui_parser_v5.swift';
+    final binaryPath = '$cacheDir/ui_parser_v7';
+    final sourcePath = '$cacheDir/ui_parser_v7.swift';
 
     if (await File(binaryPath).exists()) {
       _cachedBinaryPath = binaryPath;
@@ -396,7 +392,7 @@ if CommandLine.arguments.count >= 3 && CommandLine.arguments[1] == "--find-targe
 // Mode 2: [<pid>]  — parse accessibility tree of given PID (or frontmost)
 // =========================================================================
 var eid = 0
-let maxEls = 400
+let maxEls = Int.max
 
 // Interactive roles — always emit even without a label, because they are
 // actionable click/type targets.

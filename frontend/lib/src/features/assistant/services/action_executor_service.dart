@@ -11,24 +11,43 @@ class ActionExecutorService {
   static final ActionExecutorService instance = ActionExecutorService._();
 
   String? _typeTextBinaryPath;
+  DateTime? _lastActivation;
 
   /// PID of the target application. Set before executing actions so that
   /// clicks and keystrokes are directed to the correct process.
   int? targetAppPid;
 
   /// Activate the target application so it receives keyboard focus.
-  /// CGEvent clicks from our process don't transfer keyboard focus
-  /// to the clicked window — we must do it explicitly. Also needed
-  /// before accessibility parsing so macOS returns the full UI tree.
-  Future<void> activateTargetApp() async {
+  ///
+  /// Debounced: if the app was activated within the last 3 seconds, the
+  /// call is skipped. This prevents redundant osascript activations
+  /// (e.g. click → type_text) from disrupting in-app focus state — the
+  /// `set frontmost` AppleScript can reset which control has keyboard
+  /// focus even when the app is already frontmost.
+  ///
+  /// Pass [force] = true to bypass the debounce (used for the initial
+  /// activation before UI parsing).
+  Future<void> activateTargetApp({bool force = false}) async {
     final pid = targetAppPid;
     if (pid == null || !Platform.isMacOS) return;
+
+    if (!force && _lastActivation != null) {
+      final elapsed =
+          DateTime.now().difference(_lastActivation!).inMilliseconds;
+      if (elapsed < 3000) {
+        debugPrint('[Executor] activateTargetApp skipped '
+            '(${elapsed}ms since last)');
+        return;
+      }
+    }
+
     try {
       await Process.run('osascript', [
         '-e',
         'tell application "System Events" to set frontmost of '
             '(first process whose unix id is $pid) to true',
       ]).timeout(const Duration(seconds: 2));
+      _lastActivation = DateTime.now();
       await Future<void>.delayed(const Duration(milliseconds: 100));
     } catch (e) {
       debugPrint('[Executor] activateTargetApp($pid) failed: $e');
@@ -95,7 +114,7 @@ class ActionExecutorService {
         final x = (args['x'] as num?)?.toInt() ?? 0;
         final y = (args['y'] as num?)?.toInt() ?? 0;
         Mouse.moveTo(x, y);
-        await Future<void>.delayed(const Duration(milliseconds: 50));
+        await Future<void>.delayed(const Duration(milliseconds: 150));
       }
 
       final button = (args['button'] as String? ?? 'left').toLowerCase();
@@ -132,8 +151,7 @@ class ActionExecutorService {
         return ActionResult(ok: true, detail: 'No text to type');
       }
 
-      await activateTargetApp();
-      await Future<void>.delayed(const Duration(milliseconds: 150));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
       debugPrint('[Executor] type_text: typing "${text.length} chars" via Swift CGEvent');
 
       if (Platform.isMacOS) {
@@ -272,8 +290,6 @@ for char in text {
 
   Future<ActionResult> _pressKeys(Map<String, dynamic> args) async {
     try {
-      await activateTargetApp();
-
       var keys = args['keys'];
       if (keys is String) keys = [keys];
       if (keys is! List || keys.isEmpty) {

@@ -148,8 +148,19 @@ Types:
 - "element_visible": pass if an element with matching role/label_contains exists
 - "element_gone": pass if NO such element exists (e.g., menu dismissed)
 - "text_visible": pass if any element's label or value contains label_contains
-- "any": always pass (use sparingly — only for steps where there's nothing meaningful to check)
-Example: {"type": "element_visible", "role": "MenuItem", "label_contains": "New File"}''';
+- "any": always pass
+
+IMPORTANT verification rules:
+- For type_text: use text_visible with a SHORT fragment (first 3-5 words) of the typed text. The accessibility tree exposes text field values, so this detects if typing actually landed in the target field.
+- For press_keys: use "any" (key presses have side effects that are hard to verify generically).
+- For click that opens a menu/dialog: use element_visible for the NEW element that should appear.
+- For click that dismisses something: use element_gone for the element that should disappear.
+- For click on a submit/confirm/commit button: use element_gone to confirm the button was actually pressed (e.g., a "Commit" button should disappear or the view should change after pressing it). NEVER use "any" for important action buttons.
+- Verify must check for a CHANGE caused by the step — never check for an element that was already visible before the step.
+- ONLY use "any" for trivial navigation clicks or press_keys where no verifiable UI change occurs. For any important action (submit, commit, save, delete, send), ALWAYS verify with element_visible, element_gone, or text_visible.
+Example: {"type": "text_visible", "label_contains": "first few words"}
+Example: {"type": "element_visible", "role": "MenuItem", "label_contains": "New File"}
+Example: {"type": "element_gone", "role": "Button", "label_contains": "Commit"}''';
 
   // -----------------------------------------------------------------------
   // generateFullPlan — one LLM call, returns all steps.
@@ -184,7 +195,10 @@ ${_actionsBlock()}
 ## MANDATORY: Element-based clicking
 - For the FIRST step: use element_id from the UI element list below (IDs are current).
 - For LATER steps: use match_role and/or match_label instead (the UI will change after earlier steps execute, so current IDs become stale).
+- match_label MUST be specific enough to uniquely identify ONE element. Use the FULL label text from the element list, not just a keyword. Example: "Commit to main" not "Commit". If multiple elements share similar text, include enough of the label to distinguish the target.
+- ALWAYS provide match_role together with match_label for maximum precision.
 - NEVER invent pixel coordinates.
+- CRITICAL: Verify you select the correct element TYPE. A "Button" and a "TextArea" with similar names are NOT the same. To click a button, select the element with role=Button. To type in a field, select the TextArea/TextField/ComboBox. Read each element's role carefully before choosing.
 
 ${_thenBlock()}
 
@@ -257,6 +271,7 @@ ${_actionsBlock()}
 ## Element resolution
 Use match_role / match_label for all clicks (current element IDs are in the UI list below).
 You may also use element_id if you see an exact match in the current UI elements.
+match_label MUST be the FULL label text that uniquely identifies the element — not a keyword. Always provide match_role too.
 
 ${_thenBlock()}
 
@@ -265,14 +280,16 @@ ${_verifyBlock()}
 ${_safetyBlock()}
 
 ${uiContext.isNotEmpty ? '\n$uiContext\n' : ''}
-## Response format — return ONLY a JSON array of remaining steps (same format as initial plan).''';
+## Response format — return ONLY a JSON array of remaining steps.
+Every step MUST have: "id" (e.g. "step_6"), "title", "action", "args", "verify".
+Return [] (empty array) if the task is already complete.''';
 
     final userPrompt = '''Task: $task
 
 ## Steps already completed:
 ${historyLines.isEmpty ? '[none]' : historyLines}
 
-## Failed step:
+## Failed / checkpoint step:
 ${failedStep.id}: "${failedStep.title}" — action=${failedStep.action}
 Verification expected: ${failedStep.verify}
 Failure: $failureDetail
@@ -280,8 +297,10 @@ Failure: $failureDetail
 ## Remaining steps that were planned:
 ${remainingDesc.isEmpty ? '[none]' : remainingDesc}
 
-Look at the attached screenshot and current UI elements. Produce a NEW plan (JSON array) to complete the task from this point.
-You may retry the failed step differently, skip it, or take a completely different approach.''';
+Look at the current UI elements${screenshotPath != null ? ' and attached screenshot' : ''}. Produce a NEW plan (JSON array) to complete the ORIGINAL task from this point.
+- If a type_text action "succeeded" but verification failed, the text was likely typed — move forward rather than retrying.
+- You may retry a failed step differently, skip it, or take a completely different approach.
+- If the task is already fully complete, return [].''';
 
     return _callAndParsePlan(
       openRouterKey: openRouterKey,
@@ -312,6 +331,8 @@ You may retry the failed step differently, skip it, or take a completely differe
     debugPrint('[Planner:$label] Calling LLM (model=$model, '
         'screenshot=${screenshotPath != null ? "yes" : "no"}, '
         'uiElements=${uiContext.isEmpty ? 0 : uiContext.split('\n').length} lines)');
+    debugPrint('[Planner:$label] === SYSTEM PROMPT ===\n$systemPrompt');
+    debugPrint('[Planner:$label] === USER PROMPT ===\n$userPrompt');
 
     final raw = await _openRouter.chatCompletion(
       apiKey: openRouterKey,

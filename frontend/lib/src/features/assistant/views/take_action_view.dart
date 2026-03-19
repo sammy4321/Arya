@@ -170,41 +170,102 @@ class _TakeActionViewState extends State<TakeActionView> {
       _log('  ${s.id}: ${s.title} [${s.action}]');
     }
 
-    // --- Phase 2: Deterministic execution ---
+    // --- Phase 2: Deterministic execution with completion verification ---
     var replansUsed = 0;
     var totalSteps = 0;
+    PlannedStep? lastExecutedStep;
 
-    while (plan.isNotEmpty && totalSteps < _maxSteps) {
-      if (!mounted || !_isLoading) return;
+    while (totalSteps < _maxSteps) {
+      // Execute current plan steps.
+      while (plan.isNotEmpty && totalSteps < _maxSteps) {
+        if (!mounted || !_isLoading) return;
 
-      final step = plan.removeAt(0);
-      totalSteps++;
+        final step = plan.removeAt(0);
+        totalSteps++;
+        lastExecutedStep = step;
 
-      _updateStep(step.id, 'started', '');
-      _log('Executing: ${step.title}');
+        _updateStep(step.id, 'started', '');
+        _log('Executing: ${step.title}');
 
-      // Resolve click target — element_id or match_role/match_label.
-      final stepMap = step.toStepMap();
-      final resolvedStep = _resolveClickTarget(stepMap, _latestUIElements);
-      final adjustedStep = _offsetCoordinates(resolvedStep, regionLeft, regionTop);
+        final stepMap = step.toStepMap();
+        final resolvedStep = _resolveClickTarget(stepMap, _latestUIElements);
+        final resolvedEl =
+            (resolvedStep['args'] as Map?)?['_resolved_element'] as String?;
+        if (resolvedEl != null) {
+          _log('  → Target: $resolvedEl');
+        }
+        final adjustedStep = resolvedStep;
 
-      final result = await ActionExecutorService.instance.executeStep(adjustedStep);
+        final result =
+            await ActionExecutorService.instance.executeStep(adjustedStep);
 
-      if (!result.ok) {
-        _updateStep(step.id, 'failed', result.detail);
-        _log('FAILED: ${step.title} — ${result.detail}');
+        if (!result.ok) {
+          _updateStep(step.id, 'failed', result.detail);
+          _log('FAILED: ${step.title} — ${result.detail}');
+          history.add({
+            'step_id': step.id,
+            'title': step.title,
+            'status': 'failed',
+            'detail': result.detail,
+          });
+
+          if (replansUsed >= _maxReplans) {
+            _setAbort('Max re-plans ($replansUsed) exhausted.');
+            return;
+          }
+          plan = await _replan(
+            task: task,
+            model: model,
+            openRouterKey: openRouterKey,
+            screenContext: screenContext,
+            history: history,
+            failedStep: step,
+            failureDetail: 'Execution failed: ${result.detail}',
+            remainingSteps: plan,
+            captureRegion: captureRegion,
+          );
+          _setPlanSteps(plan);
+          replansUsed++;
+          continue;
+        }
+
+        // Execution succeeded.
         history.add({
           'step_id': step.id,
           'title': step.title,
-          'status': 'failed',
+          'status': 'completed',
           'detail': result.detail,
         });
+        _updateStep(step.id, 'completed', result.detail);
+        _log('${step.title}: ${result.detail}');
 
-        // Trigger re-plan on execution failure.
+        if (step.thenChain != null) {
+          await _executeChainedActions(
+            stepMap,
+            stepId: step.id,
+            history: history,
+          );
+        }
+
+        // --- Per-step verification ---
+        await Future.delayed(const Duration(milliseconds: 500));
+        final verifyElements = await UIParserService.instance.parseScreen(
+          targetPid: _targetAppPid,
+        );
+        _latestUIElements = verifyElements;
+
+        final passed = step.verify.check(verifyElements);
+        if (passed) {
+          _log('✓ Verify passed: ${step.verify}');
+          continue;
+        }
+
+        _log('✗ Verify FAILED: ${step.verify}');
         if (replansUsed >= _maxReplans) {
-          _setAbort('Max re-plans ($replansUsed) exhausted.');
+          _setAbort('Verification failed and max re-plans exhausted.');
           return;
         }
+
         plan = await _replan(
           task: task,
           model: model,
@@ -212,79 +273,48 @@ class _TakeActionViewState extends State<TakeActionView> {
           screenContext: screenContext,
           history: history,
           failedStep: step,
-          failureDetail: 'Execution failed: ${result.detail}',
+          failureDetail: 'Verification failed: expected ${step.verify}',
           remainingSteps: plan,
           captureRegion: captureRegion,
         );
         _setPlanSteps(plan);
         replansUsed++;
-        continue;
       }
 
-      // Execution succeeded.
-      history.add({
-        'step_id': step.id,
-        'title': step.title,
-        'status': 'completed',
-        'detail': result.detail,
-      });
-      _updateStep(step.id, 'completed', result.detail);
-      _log('${step.title}: ${result.detail}');
+      // --- Task-level completion check ---
+      if (_abortReason != null || !mounted || !_isLoading) return;
+      if (totalSteps >= _maxSteps || lastExecutedStep == null) break;
+      if (replansUsed >= _maxReplans) break;
 
-      // Execute chained "then" actions immediately.
-      if (step.thenChain != null) {
-        await _executeChainedActions(
-          stepMap,
-          stepId: step.id,
-          history: history,
-          regionLeft: regionLeft,
-          regionTop: regionTop,
-        );
-      }
-
-      // --- Phase 3: Verify ---
-      await Future.delayed(const Duration(milliseconds: 500));
-
-      // Quick UI parse for verification (no screenshot, no window hide).
-      final verifyElements = await UIParserService.instance.parseScreen(
-        region: captureRegion,
-        targetPid: _targetAppPid,
-      );
-      _latestUIElements = verifyElements;
-
-      final passed = step.verify.check(verifyElements);
-      if (passed) {
-        _log('✓ Verify passed: ${step.verify}');
-        continue;
-      }
-
-      // Verification failed — re-plan.
-      _log('✗ Verify FAILED: ${step.verify}');
-      if (replansUsed >= _maxReplans) {
-        _setAbort('Verification failed and max re-plans exhausted.');
-        return;
-      }
-
-      // Full re-capture (screenshot + UI) for the re-plan LLM call.
+      _log('Verifying task completion…');
       plan = await _replan(
         task: task,
         model: model,
         openRouterKey: openRouterKey,
         screenContext: screenContext,
         history: history,
-        failedStep: step,
-        failureDetail: 'Verification failed: expected ${step.verify}',
-        remainingSteps: plan,
+        failedStep: lastExecutedStep!,
+        failureDetail: 'All planned steps were executed. '
+            'Verify whether the original task "$task" was fully '
+            'accomplished by examining the current UI state. '
+            'Return an empty array [] if complete, '
+            'or provide additional steps if more work is needed.',
+        remainingSteps: [],
         captureRegion: captureRegion,
       );
+
+      if (plan.isEmpty) {
+        _log('✓ Task verified as complete.');
+        break;
+      }
+
+      _log('Task needs ${plan.length} more steps.');
       _setPlanSteps(plan);
       replansUsed++;
     }
 
     if (totalSteps >= _maxSteps) {
       _log('Reached maximum step limit ($_maxSteps).');
-    } else {
-      _log('All plan steps executed.');
     }
   }
 
@@ -345,8 +375,6 @@ class _TakeActionViewState extends State<TakeActionView> {
     Map<String, dynamic> stepData, {
     required String stepId,
     required List<Map<String, String>> history,
-    required int regionLeft,
-    required int regionTop,
   }) async {
     var current = stepData['then'];
     var prevAction = (stepData['action'] as String? ?? '').toLowerCase();
@@ -372,9 +400,8 @@ class _TakeActionViewState extends State<TakeActionView> {
       await Future.delayed(Duration(milliseconds: delayMs));
 
       final resolved = _resolveClickTarget(current, _latestUIElements);
-      final adjusted = _offsetCoordinates(resolved, regionLeft, regionTop);
       final chainResult =
-          await ActionExecutorService.instance.executeStep(adjusted);
+          await ActionExecutorService.instance.executeStep(resolved);
 
       history.add({
         'step_id': chainTitle,
@@ -425,26 +452,58 @@ class _TakeActionViewState extends State<TakeActionView> {
       }
     }
 
-    // Mode 2: match_role / match_label (fallback or for later steps).
+    // Mode 2: match_role / match_label — scored matching.
+    //
+    // Scoring: exact match > starts-with > contains.
+    // This prevents "Commit" from matching "Commit description" when a
+    // "Commit to main" button is available.
     if (el == null) {
       final matchRole = args['match_role'] as String?;
       final matchLabel = (args['match_label'] as String?)?.toLowerCase();
 
       if (matchRole != null || matchLabel != null) {
+        UIElement? bestMatch;
+        int bestScore = -1;
+
         for (final e in elements) {
           if (matchRole != null && e.role != matchRole) continue;
-          if (matchLabel != null &&
-              !e.label.toLowerCase().contains(matchLabel) &&
-              !e.value.toLowerCase().contains(matchLabel) &&
-              !e.description.toLowerCase().contains(matchLabel)) {
+          if (matchLabel == null) {
+            bestMatch = e;
+            break;
+          }
+
+          final label = e.label.toLowerCase();
+          final value = e.value.toLowerCase();
+          final desc = e.description.toLowerCase();
+
+          int score;
+          if (label == matchLabel || value == matchLabel || desc == matchLabel) {
+            score = 100;
+          } else if (label.startsWith(matchLabel) ||
+              value.startsWith(matchLabel)) {
+            score = 50;
+          } else if (label.contains(matchLabel) ||
+              value.contains(matchLabel) ||
+              desc.contains(matchLabel)) {
+            score = 10;
+          } else {
             continue;
           }
-          el = e;
-          debugPrint('[TakeAction] Resolved by match '
-              '(role=$matchRole, label=$matchLabel) → [${e.id}] "${e.label}"');
-          break;
+
+          debugPrint('[TakeAction] Match candidate: [${e.id}] '
+              '"${e.label}" role=${e.role} score=$score');
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestMatch = e;
+          }
         }
-        if (el == null) {
+
+        el = bestMatch;
+        if (el != null) {
+          debugPrint('[TakeAction] Best match: [${el.id}] "${el.label}" '
+              'role=${el.role} score=$bestScore');
+        } else {
           debugPrint('[TakeAction] ⚠ No element matched '
               'role=$matchRole label=$matchLabel');
         }
@@ -473,12 +532,20 @@ class _TakeActionViewState extends State<TakeActionView> {
         x = el.x + el.width - pad;
         y = el.y + el.height - pad;
       default:
-        x = el.centerX;
-        y = el.centerY;
+        // ComboBox / PopUpButton: clicking center often hits the dropdown
+        // button instead of the text input area. Bias toward the left side
+        // where the editable text portion lives.
+        if (el.role == 'ComboBox' || el.role == 'PopUpButton') {
+          x = el.x + (el.width * 0.3).round().clamp(pad, el.width - pad);
+          y = el.centerY;
+        } else {
+          x = el.centerX;
+          y = el.centerY;
+        }
     }
 
     debugPrint('[TakeAction] Click target: [${el.id}] "${el.label}" '
-        'pos=$position → ($x, $y)');
+        'role=${el.role} pos=$position → ($x, $y)');
 
     final resolvedArgs = Map<String, dynamic>.from(args)
       ..remove('element_id')
@@ -486,7 +553,8 @@ class _TakeActionViewState extends State<TakeActionView> {
       ..remove('match_label')
       ..remove('position')
       ..['x'] = x
-      ..['y'] = y;
+      ..['y'] = y
+      ..['_resolved_element'] = '[${el.id}] ${el.role}: "${el.label}"';
 
     return Map<String, dynamic>.from(step)..['args'] = resolvedArgs;
   }
@@ -538,7 +606,7 @@ class _TakeActionViewState extends State<TakeActionView> {
     ActionExecutorService.instance.targetAppPid = _targetAppPid;
 
     if (isFirstCapture && _targetAppPid != null) {
-      await ActionExecutorService.instance.activateTargetApp();
+      await ActionExecutorService.instance.activateTargetApp(force: true);
       await Future.delayed(const Duration(milliseconds: 150));
     }
 
@@ -558,7 +626,6 @@ class _TakeActionViewState extends State<TakeActionView> {
     }
 
     final elements = await UIParserService.instance.parseScreen(
-      region: region,
       targetPid: _targetAppPid,
     );
 
