@@ -1,48 +1,58 @@
 # Arya
 
-Flutter base project with a minimal UI (single floating action button).
+Monorepo with:
+
+- `frontend/`: Flutter app
+- `backend/`: FastAPI service (`GET /health`)
 
 ## Prerequisites
 
 1. Install Flutter (stable): https://docs.flutter.dev/get-started/install
-2. Ensure `flutter` is on your `PATH`.
-3. Verify setup:
+2. Ensure `flutter` is on your `PATH`
+3. Install Python 3 and ensure `python3` is on your `PATH`
 
-```bash
-flutter doctor
-```
+## Root Make Targets
 
-If `make install` fails with "Flutter is not installed or not on PATH", complete the steps above and rerun.
-
-## Usage
-
-Install project dependencies:
+Install frontend and backend dependencies:
 
 ```bash
 make install
 ```
 
-Run the app:
+Run backend + frontend together:
 
 ```bash
 make run
 ```
 
-By default `make run` targets desktop on your host OS (`macos`/`linux`/`windows`).
-Override target device if needed:
+Override defaults if needed:
 
 ```bash
-make run RUN_DEVICE=chrome
+make run RUN_DEVICE=chrome BACKEND_HOST=127.0.0.1 BACKEND_PORT=8000
 ```
 
-Clean generated artifacts:
+Clean frontend + backend artifacts:
 
 ```bash
 make clean
 ```
 
-Environment diagnostics:
+Run toolchain diagnostics for both:
 
 ```bash
 make doctor
+```
+
+## Component Targets
+
+Run only frontend:
+
+```bash
+make frontend-run RUN_DEVICE=macos
+```
+
+Run only backend:
+
+```bash
+make backend-run BACKEND_HOST=127.0.0.1 BACKEND_PORT=8000
 ```
