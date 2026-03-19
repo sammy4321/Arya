@@ -13,9 +13,8 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
-const _maxSteps = 12;
-const _maxConsecutiveAnalyze = 1;
-const _maxConsecutiveFailures = 2;
+const _maxSteps = 15;
+const _maxReplans = 3;
 
 class TakeActionView extends StatefulWidget {
   const TakeActionView({super.key});
@@ -77,7 +76,7 @@ class _TakeActionViewState extends State<TakeActionView> {
     });
     _controller.clear();
 
-    await _runAdaptiveLoop(
+    await _runPlanBasedLoop(
       task: text,
       model: model,
       attachments: attachments,
@@ -88,7 +87,17 @@ class _TakeActionViewState extends State<TakeActionView> {
 
   final StepPlanner _planner = StepPlanner();
 
-  Future<void> _runAdaptiveLoop({
+  // =========================================================================
+  // Plan-based execution loop
+  //
+  // 1. Screenshot + UI parse → LLM generates FULL plan (one call).
+  // 2. Execute each step deterministically (no LLM between steps).
+  // 3. After each step: quick UI parse → check verify criteria.
+  // 4. If criteria pass → next step.
+  // 5. If criteria fail → screenshot + LLM re-plan (max _maxReplans).
+  // =========================================================================
+
+  Future<void> _runPlanBasedLoop({
     required String task,
     required String model,
     required List<ChatAttachment> attachments,
@@ -122,154 +131,193 @@ class _TakeActionViewState extends State<TakeActionView> {
 
     final attachmentMaps = attachments.map(_toAttachmentMap).toList();
     final history = <Map<String, String>>[];
-    var consecutiveAnalyze = 0;
-    var consecutiveFailures = 0;
 
+    // --- Phase 1: Initial capture + full plan generation ---
     await _captureScreenshotAndUI('Initial context', region: captureRegion);
 
-    for (var stepNum = 1; stepNum <= _maxSteps; stepNum++) {
+    _log('Generating full plan…');
+    List<PlannedStep> plan;
+    try {
+      plan = await _planner.generateFullPlan(
+        openRouterKey: openRouterKey,
+        model: model,
+        task: task,
+        screenContext: screenContext,
+        uiContext: formatUIElementsForPrompt(_latestUIElements),
+        screenshotPath: _latestScreenshotPath,
+        tavilyKey: tavilyKey,
+        webMode: _webMode,
+        attachments: attachmentMaps,
+      );
+    } catch (e) {
+      _setAbort('Plan generation failed: $e');
+      return;
+    }
+
+    if (plan.isEmpty) {
+      _setAbort('LLM returned an empty plan.');
+      return;
+    }
+
+    _log('Plan received: ${plan.length} steps');
+    for (final s in plan) {
+      _log('  ${s.id}: ${s.title} [${s.action}] verify=${s.verify}');
+    }
+
+    // --- Phase 2: Deterministic execution ---
+    var replansUsed = 0;
+    var totalSteps = 0;
+
+    while (plan.isNotEmpty && totalSteps < _maxSteps) {
       if (!mounted || !_isLoading) return;
 
-      _log('Planning step #$stepNum...');
+      final step = plan.removeAt(0);
+      totalSteps++;
 
-      StepPlanResult planResult;
-      try {
-        planResult = await _planner.planNextStep(
-          openRouterKey: openRouterKey,
-          tavilyKey: tavilyKey,
-          model: model,
-          webMode: _webMode,
-          task: task,
-          stepNumber: stepNum,
-          history: history,
-          screenContext: screenContext,
-          attachments: attachmentMaps,
-          screenshotPath: _latestScreenshotPath,
-          uiContext: formatUIElementsForPrompt(_latestUIElements),
-        );
-      } catch (e) {
-        _log('Planning failed: $e');
-        _setAbort('Planning failed: $e');
-        return;
-      }
+      _addStep(step.id, step.title, 'started');
+      _log('Executing [${step.id}]: ${step.title}');
 
-      debugPrint('[TakeAction] Planner result: done=${planResult.done}, '
-          'reason="${planResult.reason}", step=${planResult.step}');
+      // Resolve click target — element_id or match_role/match_label.
+      final stepMap = step.toStepMap();
+      final resolvedStep = _resolveClickTarget(stepMap, _latestUIElements);
+      final adjustedStep = _offsetCoordinates(resolvedStep, regionLeft, regionTop);
 
-      if (planResult.done) {
-        final reason = planResult.reason.trim().isNotEmpty
-            ? planResult.reason.trim()
-            : 'Task completed.';
-        if (!_hasRealExecution(history)) {
-          consecutiveFailures++;
-          history.add({
-            'step_id': 'step_${stepNum}_done_rejected',
-            'title': 'Done rejected',
-            'status': 'failed',
-            'detail': 'No concrete actions executed yet.',
-          });
-          _log('Completion rejected — no real actions taken yet');
-          if (consecutiveFailures >= _maxConsecutiveFailures) {
-            _setAbort('Could not verify task completion.');
-            return;
-          }
-          continue;
+      final result = await ActionExecutorService.instance.executeStep(adjustedStep);
+
+      if (!result.ok) {
+        _updateStep(step.id, 'failed', result.detail);
+        _log('FAILED: ${step.title} — ${result.detail}');
+        history.add({
+          'step_id': step.id,
+          'title': step.title,
+          'status': 'failed',
+          'detail': result.detail,
+        });
+
+        // Trigger re-plan on execution failure.
+        if (replansUsed >= _maxReplans) {
+          _setAbort('Max re-plans ($replansUsed) exhausted.');
+          return;
         }
-        _log('Done: $reason');
-        return;
-      }
-
-      final stepData = planResult.step;
-      if (stepData == null) {
-        _log('Planner returned no step — retrying');
+        plan = await _replan(
+          task: task,
+          model: model,
+          openRouterKey: openRouterKey,
+          screenContext: screenContext,
+          history: history,
+          failedStep: step,
+          failureDetail: 'Execution failed: ${result.detail}',
+          remainingSteps: plan,
+          captureRegion: captureRegion,
+        );
+        replansUsed++;
         continue;
       }
 
-      final action = (stepData['action'] as String? ?? '').toLowerCase().trim();
-      final stepId = stepData['id'] as String? ?? 'step_$stepNum';
-      final title = stepData['title'] as String? ?? 'Step $stepNum';
+      // Execution succeeded.
+      history.add({
+        'step_id': step.id,
+        'title': step.title,
+        'status': 'completed',
+        'detail': result.detail,
+      });
+      _updateStep(step.id, 'completed', result.detail);
+      _log('${step.title}: ${result.detail}');
 
-      if ({'analyze', 'think', 'observe', 'element_not_found'}.contains(action)) {
-        consecutiveAnalyze++;
-        final detail = action == 'element_not_found'
-            ? 'Element not found: ${stepData['args']?['description'] ?? 'unknown'}. '
-                'Re-capture screen and retry.'
-            : 'Analyze actions do nothing — produce a concrete action.';
-        if (consecutiveAnalyze > _maxConsecutiveAnalyze) {
-          history.add({
-            'step_id': stepId,
-            'title': title,
-            'status': 'failed',
-            'detail': detail,
-          });
-          consecutiveFailures++;
-          _log('$action detected — forcing replan');
-          if (consecutiveFailures >= _maxConsecutiveFailures) {
-            _setAbort('Planner stuck ($action loop).');
-            return;
-          }
-          // Re-capture to get fresh UI elements before retrying.
-          if (action == 'element_not_found') {
-            await _captureScreenshotAndUI('Re-capture for retry',
-                hideWindow: false, region: captureRegion);
-          }
-          continue;
-        }
-      } else {
-        consecutiveAnalyze = 0;
-      }
-
-      _addStep(stepId, title, 'started');
-      _log('Executing: $title');
-
-      // Resolve element_id → region-relative coordinates, then add region
-      // offset for absolute screen coordinates.
-      final resolvedStep = _resolveElementClick(stepData, _latestUIElements);
-      final adjustedStep = _offsetCoordinates(resolvedStep, regionLeft, regionTop);
-      final result = await ActionExecutorService.instance.executeStep(adjustedStep);
-
-      if (result.ok) {
-        consecutiveFailures = 0;
-        history.add({
-          'step_id': stepId,
-          'title': title,
-          'status': 'completed',
-          'detail': result.detail,
-        });
-        _updateStep(stepId, 'completed', result.detail);
-        _log('$title: ${result.detail}');
-
-        // Execute chained "then" actions immediately (no re-plan cycle).
+      // Execute chained "then" actions immediately.
+      if (step.thenChain != null) {
         await _executeChainedActions(
-          stepData,
-          stepId: stepId,
+          stepMap,
+          stepId: step.id,
           history: history,
           regionLeft: regionLeft,
           regionTop: regionTop,
         );
-
-        await Future.delayed(const Duration(milliseconds: 500));
-        await _captureScreenshotAndUI('After: $title',
-            hideWindow: false, region: captureRegion);
-      } else {
-        consecutiveFailures++;
-        history.add({
-          'step_id': stepId,
-          'title': title,
-          'status': 'failed',
-          'detail': result.detail,
-        });
-        _updateStep(stepId, 'failed', result.detail);
-        _log('Failed: $title — ${result.detail}');
-
-        if (consecutiveFailures >= _maxConsecutiveFailures) {
-          _setAbort('Multiple steps failed. Execution stopped.');
-          return;
-        }
       }
+
+      // --- Phase 3: Verify ---
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      // Quick UI parse for verification (no screenshot, no window hide).
+      final verifyElements = await UIParserService.instance.parseScreen(
+        region: captureRegion,
+        targetPid: _targetAppPid,
+      );
+      _latestUIElements = verifyElements;
+
+      final passed = step.verify.check(verifyElements);
+      if (passed) {
+        _log('✓ Verify passed: ${step.verify}');
+        continue;
+      }
+
+      // Verification failed — re-plan.
+      _log('✗ Verify FAILED: ${step.verify}');
+      if (replansUsed >= _maxReplans) {
+        _setAbort('Verification failed and max re-plans exhausted.');
+        return;
+      }
+
+      // Full re-capture (screenshot + UI) for the re-plan LLM call.
+      plan = await _replan(
+        task: task,
+        model: model,
+        openRouterKey: openRouterKey,
+        screenContext: screenContext,
+        history: history,
+        failedStep: step,
+        failureDetail: 'Verification failed: expected ${step.verify}',
+        remainingSteps: plan,
+        captureRegion: captureRegion,
+      );
+      replansUsed++;
     }
 
-    _log('Reached maximum step limit.');
+    if (totalSteps >= _maxSteps) {
+      _log('Reached maximum step limit ($_maxSteps).');
+    } else {
+      _log('All plan steps executed.');
+    }
+  }
+
+  /// Captures fresh context and calls LLM to produce a new plan.
+  Future<List<PlannedStep>> _replan({
+    required String task,
+    required String model,
+    required String openRouterKey,
+    required Map<String, dynamic> screenContext,
+    required List<Map<String, String>> history,
+    required PlannedStep failedStep,
+    required String failureDetail,
+    required List<PlannedStep> remainingSteps,
+    required CaptureRegion captureRegion,
+  }) async {
+    _log('Re-planning (capturing fresh context)…');
+    await _captureScreenshotAndUI('Re-plan context',
+        hideWindow: false, region: captureRegion);
+
+    try {
+      final newPlan = await _planner.replanFromFailure(
+        openRouterKey: openRouterKey,
+        model: model,
+        task: task,
+        screenContext: screenContext,
+        uiContext: formatUIElementsForPrompt(_latestUIElements),
+        history: history,
+        failedStep: failedStep,
+        failureDetail: failureDetail,
+        remainingSteps: remainingSteps,
+        screenshotPath: _latestScreenshotPath,
+      );
+      _log('Re-plan received: ${newPlan.length} steps');
+      for (final s in newPlan) {
+        _log('  ${s.id}: ${s.title} [${s.action}] verify=${s.verify}');
+      }
+      return newPlan;
+    } catch (e) {
+      _log('Re-plan failed: $e');
+      return [];
+    }
   }
 
   /// Walks the "then" chain in a step and executes each follow-up action
@@ -315,7 +363,7 @@ class _TakeActionViewState extends State<TakeActionView> {
       _log('Chain [$chainIndex]: $chainAction (wait ${delayMs}ms)');
       await Future.delayed(Duration(milliseconds: delayMs));
 
-      final resolved = _resolveElementClick(current, _latestUIElements);
+      final resolved = _resolveClickTarget(current, _latestUIElements);
       final adjusted = _offsetCoordinates(resolved, regionLeft, regionTop);
       final chainResult =
           await ActionExecutorService.instance.executeStep(adjusted);
@@ -335,13 +383,15 @@ class _TakeActionViewState extends State<TakeActionView> {
     }
   }
 
-  /// Resolves element_id → region-relative (x, y) using the parsed UI tree.
+  /// Resolves a click target to concrete (x, y) coordinates.
   ///
-  /// The LLM outputs {"element_id": 6, "position": "center"} and this method
-  /// looks up element 6, computes the click point based on position, and
-  /// replaces element_id/position with concrete x/y in the args. If no
-  /// element_id is present (fallback), the step is returned unchanged.
-  Map<String, dynamic> _resolveElementClick(
+  /// Supports two modes:
+  /// 1. **element_id** — direct lookup by parsed ID (used for step 1).
+  /// 2. **match_role / match_label** — descriptive search (used for later
+  ///    steps where the UI has changed and IDs are stale).
+  ///
+  /// Also applies position ("center", "top_left", etc.) with padding.
+  Map<String, dynamic> _resolveClickTarget(
     Map<String, dynamic> step,
     List<UIElement> elements,
   ) {
@@ -351,18 +401,51 @@ class _TakeActionViewState extends State<TakeActionView> {
     final args = step['args'];
     if (args is! Map<String, dynamic>) return step;
 
-    final elementId = args['element_id'];
-    if (elementId == null) return step;
+    UIElement? el;
 
-    final id = (elementId as num).toInt();
-    final match = elements.where((e) => e.id == id);
-    if (match.isEmpty) {
-      debugPrint('[TakeAction] ⚠ Element [$id] not found — '
-          '${elements.length} elements available');
-      return step;
+    // Mode 1: element_id.
+    final elementId = args['element_id'];
+    if (elementId != null) {
+      final id = (elementId as num).toInt();
+      final match = elements.where((e) => e.id == id);
+      if (match.isNotEmpty) {
+        el = match.first;
+        debugPrint('[TakeAction] Resolved by id [$id] "${el.label}"');
+      } else {
+        debugPrint('[TakeAction] ⚠ Element [$id] not found — '
+            '${elements.length} elements available');
+      }
     }
 
-    final el = match.first;
+    // Mode 2: match_role / match_label (fallback or for later steps).
+    if (el == null) {
+      final matchRole = args['match_role'] as String?;
+      final matchLabel = (args['match_label'] as String?)?.toLowerCase();
+
+      if (matchRole != null || matchLabel != null) {
+        for (final e in elements) {
+          if (matchRole != null && e.role != matchRole) continue;
+          if (matchLabel != null &&
+              !e.label.toLowerCase().contains(matchLabel) &&
+              !e.value.toLowerCase().contains(matchLabel) &&
+              !e.description.toLowerCase().contains(matchLabel)) {
+            continue;
+          }
+          el = e;
+          debugPrint('[TakeAction] Resolved by match '
+              '(role=$matchRole, label=$matchLabel) → [${e.id}] "${e.label}"');
+          break;
+        }
+        if (el == null) {
+          debugPrint('[TakeAction] ⚠ No element matched '
+              'role=$matchRole label=$matchLabel');
+        }
+      }
+    }
+
+    // If no element resolved, return step unchanged (raw x/y fallback).
+    if (el == null) return step;
+
     final position =
         (args['position'] as String? ?? 'center').toLowerCase();
 
@@ -386,11 +469,13 @@ class _TakeActionViewState extends State<TakeActionView> {
         y = el.centerY;
     }
 
-    debugPrint('[TakeAction] Resolved [$id] "${el.label}" '
-        'pos=$position → region-relative ($x, $y)');
+    debugPrint('[TakeAction] Click target: [${el.id}] "${el.label}" '
+        'pos=$position → ($x, $y)');
 
     final resolvedArgs = Map<String, dynamic>.from(args)
       ..remove('element_id')
+      ..remove('match_role')
+      ..remove('match_label')
       ..remove('position')
       ..['x'] = x
       ..['y'] = y;
@@ -426,14 +511,6 @@ class _TakeActionViewState extends State<TakeActionView> {
     return Map<String, dynamic>.from(step)..['args'] = adjustedArgs;
   }
 
-  bool _hasRealExecution(List<Map<String, String>> history) {
-    return history.any((h) =>
-        h['status'] == 'completed' &&
-        !{'analysis step completed.', 'waited'}.any(
-          (skip) => (h['detail'] ?? '').toLowerCase().startsWith(skip),
-        ));
-  }
-
   /// Captures a screenshot and parses the accessibility tree.
   ///
   /// When [hideWindow] is true we manage the hide/show cycle ourselves so that
@@ -457,6 +534,14 @@ class _TakeActionViewState extends State<TakeActionView> {
     _targetAppPid ??=
         await UIParserService.instance.getFrontmostPid(region: region);
     ActionExecutorService.instance.targetAppPid = _targetAppPid;
+
+    // Activate the target app so macOS gives us its full accessibility tree.
+    // Without this, non-frontmost apps return a sparse tree (e.g., 2 elements
+    // instead of 136).
+    if (_targetAppPid != null) {
+      await ActionExecutorService.instance.activateTargetApp();
+      await Future.delayed(const Duration(milliseconds: 150));
+    }
 
     // Screenshot without its own hide/show — we handle that.
     String? path = await ScreenshotService.instance.captureFullScreen(

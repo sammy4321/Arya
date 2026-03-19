@@ -18,8 +18,9 @@ class ActionExecutorService {
 
   /// Activate the target application so it receives keyboard focus.
   /// CGEvent clicks from our process don't transfer keyboard focus
-  /// to the clicked window — we must do it explicitly.
-  Future<void> _activateTargetApp() async {
+  /// to the clicked window — we must do it explicitly. Also needed
+  /// before accessibility parsing so macOS returns the full UI tree.
+  Future<void> activateTargetApp() async {
     final pid = targetAppPid;
     if (pid == null || !Platform.isMacOS) return;
     try {
@@ -30,7 +31,7 @@ class ActionExecutorService {
       ]).timeout(const Duration(seconds: 2));
       await Future<void>.delayed(const Duration(milliseconds: 100));
     } catch (e) {
-      debugPrint('[Executor] _activateTargetApp($pid) failed: $e');
+      debugPrint('[Executor] activateTargetApp($pid) failed: $e');
     }
   }
 
@@ -88,7 +89,7 @@ class ActionExecutorService {
 
   Future<ActionResult> _click(Map<String, dynamic> args) async {
     try {
-      await _activateTargetApp();
+      await activateTargetApp();
 
       if (args.containsKey('x') && args.containsKey('y')) {
         final x = (args['x'] as num?)?.toInt() ?? 0;
@@ -131,7 +132,7 @@ class ActionExecutorService {
         return ActionResult(ok: true, detail: 'No text to type');
       }
 
-      await _activateTargetApp();
+      await activateTargetApp();
       await Future<void>.delayed(const Duration(milliseconds: 150));
       debugPrint('[Executor] type_text: typing "${text.length} chars" via Swift CGEvent');
 
@@ -271,7 +272,7 @@ for char in text {
 
   Future<ActionResult> _pressKeys(Map<String, dynamic> args) async {
     try {
-      await _activateTargetApp();
+      await activateTargetApp();
 
       var keys = args['keys'];
       if (keys is String) keys = [keys];
