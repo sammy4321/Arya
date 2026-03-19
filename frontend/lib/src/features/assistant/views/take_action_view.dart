@@ -10,7 +10,6 @@ import 'package:arya_app/src/features/assistant/services/ui_parser_service.dart'
 import 'package:arya_app/src/features/settings/ai_settings_store.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
-import 'package:window_manager/window_manager.dart';
 
 const _maxSteps = 15;
 const _maxReplans = 3;
@@ -303,7 +302,7 @@ class _TakeActionViewState extends State<TakeActionView> {
   }) async {
     _log('Re-planning (capturing fresh context + screenshot)…');
     await _captureContext('Re-plan context',
-        hideWindow: false, captureScreenshot: true, region: captureRegion);
+        captureScreenshot: true, region: captureRegion);
 
     try {
       final newPlan = await _planner.replanFromFailure(
@@ -520,31 +519,25 @@ class _TakeActionViewState extends State<TakeActionView> {
     return Map<String, dynamic>.from(step)..['args'] = adjustedArgs;
   }
 
-  /// Resolves the target app PID, activates it, parses its accessibility
-  /// tree, and optionally captures a screenshot.
+  /// Resolves the target app PID, parses its accessibility tree, and
+  /// optionally captures a screenshot for re-plan calls.
   ///
-  /// [captureScreenshot] defaults to false — screenshots are only taken for
-  /// re-plan (failure recovery) calls where visual context helps the LLM
-  /// diagnose what went wrong.
-  ///
-  /// When [hideWindow] is true we manage the hide/show cycle ourselves so
-  /// that PID resolution and parsing happen while the target app is frontmost.
+  /// PID resolution uses `getFrontmostPid` which already skips our own PID
+  /// by walking the window list. The UI parser queries the target app's
+  /// accessibility tree directly by PID — no need to hide Arya or change
+  /// window focus. `activateTargetApp` is called once (on first capture)
+  /// to ensure macOS provides a complete accessibility tree.
   Future<void> _captureContext(
     String label, {
-    bool hideWindow = true,
     bool captureScreenshot = false,
     CaptureRegion? region,
   }) async {
-    if (hideWindow && supportsDesktopWindowControls) {
-      await windowManager.hide();
-      await Future.delayed(const Duration(milliseconds: 220));
-    }
-
+    final isFirstCapture = _targetAppPid == null;
     _targetAppPid ??=
         await UIParserService.instance.getFrontmostPid(region: region);
     ActionExecutorService.instance.targetAppPid = _targetAppPid;
 
-    if (_targetAppPid != null) {
+    if (isFirstCapture && _targetAppPid != null) {
       await ActionExecutorService.instance.activateTargetApp();
       await Future.delayed(const Duration(milliseconds: 150));
     }
@@ -568,10 +561,6 @@ class _TakeActionViewState extends State<TakeActionView> {
       region: region,
       targetPid: _targetAppPid,
     );
-
-    if (hideWindow && supportsDesktopWindowControls) {
-      await windowManager.show();
-    }
 
     if (!mounted) return;
     if (path != null && path.isNotEmpty) {
