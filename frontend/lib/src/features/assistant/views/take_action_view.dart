@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:arya_app/src/core/window_helpers.dart';
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
@@ -26,8 +25,10 @@ class TakeActionView extends StatefulWidget {
 class _TakeActionViewState extends State<TakeActionView> {
   final _controller = TextEditingController();
   bool _isLoading = false;
+  bool _isPlanning = false;
   String _webMode = 'auto';
   String? _abortReason;
+  String? _taskText;
   final List<_CapturedScreenshot> _capturedScreenshots = [];
   final List<ChatAttachment> _pendingAttachments = [];
   final List<_ActionStep> _steps = [];
@@ -64,7 +65,9 @@ class _TakeActionViewState extends State<TakeActionView> {
 
     final attachments = List<ChatAttachment>.from(_pendingAttachments);
     setState(() {
+      _taskText = text;
       _isLoading = true;
+      _isPlanning = false;
       _steps.clear();
       _logs.clear();
       _capturedScreenshots.clear();
@@ -125,17 +128,17 @@ class _TakeActionViewState extends State<TakeActionView> {
       height: regionHeight,
     );
 
-    _log('Session started on current screen');
     _log('Screen region: ($regionLeft,$regionTop) '
         '${regionWidth}x$regionHeight scale=$scaleFactor');
 
     final attachmentMaps = attachments.map(_toAttachmentMap).toList();
     final history = <Map<String, String>>[];
 
-    // --- Phase 1: Initial capture + full plan generation ---
-    await _captureScreenshotAndUI('Initial context', region: captureRegion);
+    // --- Phase 1: Initial capture (UI elements only) + full plan ---
+    if (mounted) setState(() => _isPlanning = true);
+    await _captureContext('Initial context', region: captureRegion);
 
-    _log('Generating full plan…');
+    _log('Generating plan…');
     List<PlannedStep> plan;
     try {
       plan = await _planner.generateFullPlan(
@@ -150,18 +153,22 @@ class _TakeActionViewState extends State<TakeActionView> {
         attachments: attachmentMaps,
       );
     } catch (e) {
+      if (mounted) setState(() => _isPlanning = false);
       _setAbort('Plan generation failed: $e');
       return;
     }
+
+    if (mounted) setState(() => _isPlanning = false);
 
     if (plan.isEmpty) {
       _setAbort('LLM returned an empty plan.');
       return;
     }
 
-    _log('Plan received: ${plan.length} steps');
+    _setPlanSteps(plan);
+    _log('Plan: ${plan.length} steps');
     for (final s in plan) {
-      _log('  ${s.id}: ${s.title} [${s.action}] verify=${s.verify}');
+      _log('  ${s.id}: ${s.title} [${s.action}]');
     }
 
     // --- Phase 2: Deterministic execution ---
@@ -174,8 +181,8 @@ class _TakeActionViewState extends State<TakeActionView> {
       final step = plan.removeAt(0);
       totalSteps++;
 
-      _addStep(step.id, step.title, 'started');
-      _log('Executing [${step.id}]: ${step.title}');
+      _updateStep(step.id, 'started', '');
+      _log('Executing: ${step.title}');
 
       // Resolve click target — element_id or match_role/match_label.
       final stepMap = step.toStepMap();
@@ -210,6 +217,7 @@ class _TakeActionViewState extends State<TakeActionView> {
           remainingSteps: plan,
           captureRegion: captureRegion,
         );
+        _setPlanSteps(plan);
         replansUsed++;
         continue;
       }
@@ -270,6 +278,7 @@ class _TakeActionViewState extends State<TakeActionView> {
         remainingSteps: plan,
         captureRegion: captureRegion,
       );
+      _setPlanSteps(plan);
       replansUsed++;
     }
 
@@ -292,9 +301,9 @@ class _TakeActionViewState extends State<TakeActionView> {
     required List<PlannedStep> remainingSteps,
     required CaptureRegion captureRegion,
   }) async {
-    _log('Re-planning (capturing fresh context)…');
-    await _captureScreenshotAndUI('Re-plan context',
-        hideWindow: false, region: captureRegion);
+    _log('Re-planning (capturing fresh context + screenshot)…');
+    await _captureContext('Re-plan context',
+        hideWindow: false, captureScreenshot: true, region: captureRegion);
 
     try {
       final newPlan = await _planner.replanFromFailure(
@@ -511,15 +520,19 @@ class _TakeActionViewState extends State<TakeActionView> {
     return Map<String, dynamic>.from(step)..['args'] = adjustedArgs;
   }
 
-  /// Captures a screenshot and parses the accessibility tree.
+  /// Resolves the target app PID, activates it, parses its accessibility
+  /// tree, and optionally captures a screenshot.
   ///
-  /// When [hideWindow] is true we manage the hide/show cycle ourselves so that
-  /// both the screenshot and UI parse happen while the target app is frontmost.
-  /// The target PID is captured on the first call and reused for subsequent
-  /// calls (where [hideWindow] is false) so we always parse the right app.
-  Future<void> _captureScreenshotAndUI(
+  /// [captureScreenshot] defaults to false — screenshots are only taken for
+  /// re-plan (failure recovery) calls where visual context helps the LLM
+  /// diagnose what went wrong.
+  ///
+  /// When [hideWindow] is true we manage the hide/show cycle ourselves so
+  /// that PID resolution and parsing happen while the target app is frontmost.
+  Future<void> _captureContext(
     String label, {
     bool hideWindow = true,
+    bool captureScreenshot = false,
     CaptureRegion? region,
   }) async {
     if (hideWindow && supportsDesktopWindowControls) {
@@ -527,36 +540,30 @@ class _TakeActionViewState extends State<TakeActionView> {
       await Future.delayed(const Duration(milliseconds: 220));
     }
 
-    // Capture the target PID while our window is hidden (first call) so we
-    // know which app to parse on later calls when we don't hide.
-    // Pass the capture region so on multi-monitor setups we only consider
-    // windows on the same screen.
     _targetAppPid ??=
         await UIParserService.instance.getFrontmostPid(region: region);
     ActionExecutorService.instance.targetAppPid = _targetAppPid;
 
-    // Activate the target app so macOS gives us its full accessibility tree.
-    // Without this, non-frontmost apps return a sparse tree (e.g., 2 elements
-    // instead of 136).
     if (_targetAppPid != null) {
       await ActionExecutorService.instance.activateTargetApp();
       await Future.delayed(const Duration(milliseconds: 150));
     }
 
-    // Screenshot without its own hide/show — we handle that.
-    String? path = await ScreenshotService.instance.captureFullScreen(
-      hideWindow: false,
-      region: region,
-    );
-    if (path == null) {
-      await Future.delayed(const Duration(milliseconds: 220));
+    String? path;
+    if (captureScreenshot) {
       path = await ScreenshotService.instance.captureFullScreen(
         hideWindow: false,
         region: region,
       );
+      if (path == null) {
+        await Future.delayed(const Duration(milliseconds: 220));
+        path = await ScreenshotService.instance.captureFullScreen(
+          hideWindow: false,
+          region: region,
+        );
+      }
     }
 
-    // Parse the target app's accessibility tree using the cached PID.
     final elements = await UIParserService.instance.parseScreen(
       region: region,
       targetPid: _targetAppPid,
@@ -573,13 +580,13 @@ class _TakeActionViewState extends State<TakeActionView> {
     _latestUIElements = elements;
 
     setState(() {
-      if (path != null && path.isNotEmpty) {
+      if (captureScreenshot && path != null && path.isNotEmpty) {
         _capturedScreenshots.add(
           _CapturedScreenshot(path: path, label: label, createdAt: DateTime.now()),
         );
         _logs.add('$label (screenshot + ${elements.length} UI elements)');
       } else {
-        _logs.add('$label (screenshot failed, ${elements.length} UI elements)');
+        _logs.add('$label (${elements.length} UI elements)');
       }
     });
   }
@@ -599,19 +606,24 @@ class _TakeActionViewState extends State<TakeActionView> {
     });
   }
 
-  void _addStep(String id, String title, String status) {
-    if (!mounted) return;
-    setState(() {
-      _steps.add(_ActionStep(id: id, title: title, status: status, detail: ''));
-    });
-  }
-
   void _updateStep(String id, String status, String detail) {
     if (!mounted) return;
     setState(() {
       final index = _steps.indexWhere((s) => s.id == id);
       if (index >= 0) {
         _steps[index] = _steps[index].copyWith(status: status, detail: detail);
+      }
+    });
+  }
+
+  void _setPlanSteps(List<PlannedStep> plan) {
+    if (!mounted) return;
+    setState(() {
+      _steps.removeWhere((s) => s.status == 'pending');
+      for (final s in plan) {
+        _steps.add(
+          _ActionStep(id: s.id, title: s.title, status: 'pending', detail: ''),
+        );
       }
     });
   }
@@ -671,26 +683,21 @@ class _TakeActionViewState extends State<TakeActionView> {
     return Container(
       width: double.infinity,
       color: const Color(0xFF373E47),
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      padding: const EdgeInsets.fromLTRB(16, 2, 16, 2),
       child: Row(
         children: [
-          _StatusBadge(
-            label: _isLoading ? 'Running' : 'Idle',
-            color: _isLoading
-                ? const Color(0xFF64B5F6)
-                : const Color(0xFF6B7585),
-          ),
-          const SizedBox(width: 8),
+          const Spacer(),
           const Text(
             'Web:',
-            style: TextStyle(color: Color(0xFF9EA5AF), fontSize: 12),
+            style: TextStyle(color: Color(0xFF6B7585), fontSize: 11),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 4),
           DropdownButtonHideUnderline(
             child: DropdownButton<String>(
               value: _webMode,
               dropdownColor: const Color(0xFF2A3441),
-              style: const TextStyle(color: Color(0xFFE8E9EB), fontSize: 12),
+              isDense: true,
+              style: const TextStyle(color: Color(0xFF9EA5AF), fontSize: 11),
               items: const [
                 DropdownMenuItem(value: 'auto', child: Text('Auto')),
                 DropdownMenuItem(value: 'always', child: Text('Always')),
@@ -710,126 +717,63 @@ class _TakeActionViewState extends State<TakeActionView> {
   }
 
   Widget _buildProgressPanel() {
-    if (_steps.isEmpty && _logs.isEmpty) {
+    if (_taskText == null && _steps.isEmpty && _logs.isEmpty) {
       return const Center(
-        child: SelectableText(
-          'Describe the action you want me to take',
-          style: TextStyle(color: Color(0xFF9EA5AF), fontSize: 14),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.touch_app_outlined, color: Color(0xFF4E5661), size: 32),
+            SizedBox(height: 12),
+            Text(
+              'Describe the action you want me to take',
+              style: TextStyle(color: Color(0xFF6B7585), fontSize: 14),
+            ),
+          ],
         ),
       );
     }
 
+    final isComplete =
+        !_isLoading && _steps.isNotEmpty && _abortReason == null;
+
     return SelectionArea(
       child: ListView(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         children: [
-          if (_abortReason != null)
-            Container(
-              margin: const EdgeInsets.only(bottom: 10),
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: const Color(0xFFE57373).withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: const Color(0xFFE57373)),
+          if (_taskText != null) ...[
+            _TaskBubble(text: _taskText!),
+            const SizedBox(height: 16),
+          ],
+          if (_isPlanning) ...[
+            const _PlanningIndicator(),
+            const SizedBox(height: 12),
+          ],
+          if (_steps.isNotEmpty)
+            for (var i = 0; i < _steps.length; i++)
+              _StepTimelineRow(
+                step: _steps[i],
+                isFirst: i == 0,
+                isLast: i == _steps.length - 1,
               ),
-              child: Text(
-                'Aborted: $_abortReason',
-                style: const TextStyle(
-                  color: Color(0xFFFFCDD2),
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
+          if (isComplete) ...[
+            const SizedBox(height: 8),
+            const _ResultBanner(
+              icon: Icons.check_circle_outline,
+              color: Color(0xFF81C784),
+              text: 'All steps completed',
             ),
-          for (final step in _steps)
-            Container(
-              margin: const EdgeInsets.only(bottom: 8),
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF4E5661),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: _statusColor(step.status)),
-              ),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(
-                    _statusIcon(step.status),
-                    size: 14,
-                    color: _statusColor(step.status),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          step.title,
-                          style: const TextStyle(
-                            color: Color(0xFFE8E9EB),
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        if (step.detail.isNotEmpty) ...[
-                          const SizedBox(height: 4),
-                          Text(
-                            step.detail,
-                            style: const TextStyle(
-                              color: Color(0xFFCDD4DE),
-                              fontSize: 12,
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          if (_capturedScreenshots.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            const Text(
-              'Screenshots',
-              style: TextStyle(
-                color: Color(0xFF9EA5AF),
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(height: 6),
-            SizedBox(
-              height: 110,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                itemCount: _capturedScreenshots.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 8),
-                itemBuilder: (context, index) {
-                  final shot = _capturedScreenshots[index];
-                  return _ScreenshotTile(shot: shot);
-                },
-              ),
+          ],
+          if (_abortReason != null) ...[
+            const SizedBox(height: 8),
+            _ResultBanner(
+              icon: Icons.error_outline,
+              color: const Color(0xFFE57373),
+              text: _abortReason!,
             ),
           ],
           if (_logs.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            const Text(
-              'Logs',
-              style: TextStyle(
-                color: Color(0xFF9EA5AF),
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(height: 6),
-            for (final log in _logs.take(50).toList().reversed)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 4),
-                child: Text(
-                  '- $log',
-                  style: const TextStyle(color: Color(0xFFCDD4DE), fontSize: 11),
-                ),
-              ),
+            const SizedBox(height: 14),
+            _CollapsibleLogSection(logs: _logs),
           ],
         ],
       ),
@@ -921,31 +865,6 @@ class _TakeActionViewState extends State<TakeActionView> {
     );
   }
 
-  Color _statusColor(String status) {
-    switch (status) {
-      case 'completed':
-        return const Color(0xFF81C784);
-      case 'started':
-        return const Color(0xFF64B5F6);
-      case 'failed':
-        return const Color(0xFFE57373);
-      default:
-        return const Color(0xFF6B7585);
-    }
-  }
-
-  IconData _statusIcon(String status) {
-    switch (status) {
-      case 'completed':
-        return Icons.check_circle;
-      case 'started':
-        return Icons.sync;
-      case 'failed':
-        return Icons.error;
-      default:
-        return Icons.radio_button_unchecked;
-    }
-  }
 }
 
 class _ActionStep {
@@ -971,29 +890,6 @@ class _ActionStep {
   }
 }
 
-class _StatusBadge extends StatelessWidget {
-  const _StatusBadge({required this.label, required this.color});
-
-  final String label;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.15),
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: color),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600),
-      ),
-    );
-  }
-}
-
 class _CapturedScreenshot {
   const _CapturedScreenshot({
     required this.path,
@@ -1006,52 +902,314 @@ class _CapturedScreenshot {
   final DateTime createdAt;
 }
 
-class _ScreenshotTile extends StatelessWidget {
-  const _ScreenshotTile({required this.shot});
+// ---------------------------------------------------------------------------
+// UI Widgets
+// ---------------------------------------------------------------------------
 
-  final _CapturedScreenshot shot;
+class _TaskBubble extends StatelessWidget {
+  const _TaskBubble({required this.text});
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerRight,
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 320),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1F80E9).withValues(alpha: 0.12),
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(16),
+            topRight: Radius.circular(4),
+            bottomLeft: Radius.circular(16),
+            bottomRight: Radius.circular(16),
+          ),
+        ),
+        child: Text(
+          text,
+          style: const TextStyle(
+            color: Color(0xFFE8E9EB),
+            fontSize: 13,
+            height: 1.4,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlanningIndicator extends StatelessWidget {
+  const _PlanningIndicator();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Row(
+      children: [
+        SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(
+            strokeWidth: 1.5,
+            color: Color(0xFF9EA5AF),
+          ),
+        ),
+        SizedBox(width: 10),
+        Text(
+          'Analyzing screen and planning…',
+          style: TextStyle(
+            color: Color(0xFF9EA5AF),
+            fontSize: 13,
+            fontStyle: FontStyle.italic,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StepTimelineRow extends StatelessWidget {
+  const _StepTimelineRow({
+    required this.step,
+    required this.isFirst,
+    required this.isLast,
+  });
+
+  final _ActionStep step;
+  final bool isFirst;
+  final bool isLast;
+
+  static const _lineColor = Color(0xFF4E5661);
+
+  @override
+  Widget build(BuildContext context) {
+    return IntrinsicHeight(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 24,
+            child: Column(
+              children: [
+                Container(
+                  width: 1.5,
+                  height: 4,
+                  color: isFirst ? Colors.transparent : _lineColor,
+                ),
+                _StatusDot(status: step.status),
+                Expanded(
+                  child: Container(
+                    width: 1.5,
+                    color: isLast ? Colors.transparent : _lineColor,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    step.title,
+                    style: TextStyle(
+                      color: _titleColor,
+                      fontSize: 13,
+                      fontWeight: step.status == 'pending'
+                          ? FontWeight.w400
+                          : FontWeight.w500,
+                    ),
+                  ),
+                  if (step.detail.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      step.detail,
+                      style: const TextStyle(
+                        color: Color(0xFF6B7585),
+                        fontSize: 11.5,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Color get _titleColor {
+    switch (step.status) {
+      case 'completed':
+        return const Color(0xFFCDD4DE);
+      case 'started':
+        return const Color(0xFFE8E9EB);
+      case 'failed':
+        return const Color(0xFFE57373);
+      default:
+        return const Color(0xFF6B7585);
+    }
+  }
+}
+
+class _StatusDot extends StatelessWidget {
+  const _StatusDot({required this.status});
+  final String status;
+
+  @override
+  Widget build(BuildContext context) {
+    switch (status) {
+      case 'completed':
+        return const Icon(
+          Icons.check_circle,
+          size: 16,
+          color: Color(0xFF81C784),
+        );
+      case 'started':
+        return const SizedBox(
+          width: 16,
+          height: 16,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: Color(0xFF64B5F6),
+          ),
+        );
+      case 'failed':
+        return const Icon(
+          Icons.cancel,
+          size: 16,
+          color: Color(0xFFE57373),
+        );
+      default:
+        return Container(
+          width: 16,
+          height: 16,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: const Color(0xFF4E5661),
+              width: 1.5,
+            ),
+          ),
+        );
+    }
+  }
+}
+
+class _ResultBanner extends StatelessWidget {
+  const _ResultBanner({
+    required this.icon,
+    required this.color,
+    required this.text,
+  });
+
+  final IconData icon;
+  final Color color;
+  final String text;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 170,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        color: const Color(0xFF4E5661),
-        borderRadius: BorderRadius.circular(8),
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
       ),
-      padding: const EdgeInsets.all(6),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         children: [
+          Icon(icon, size: 16, color: color),
+          const SizedBox(width: 8),
           Expanded(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: Image.file(
-                File(shot.path),
-                width: double.infinity,
-                fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => const ColoredBox(
-                  color: Color(0xFF2F3640),
-                  child: Center(
-                    child: Icon(
-                      Icons.broken_image_outlined,
-                      color: Color(0xFF9EA5AF),
-                      size: 20,
-                    ),
-                  ),
-                ),
+            child: Text(
+              text,
+              style: TextStyle(
+                color: color,
+                fontSize: 12.5,
+                fontWeight: FontWeight.w500,
               ),
             ),
           ),
-          const SizedBox(height: 4),
-          Text(
-            shot.label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(color: Color(0xFFD2D8DF), fontSize: 10.5),
-          ),
         ],
       ),
+    );
+  }
+}
+
+class _CollapsibleLogSection extends StatefulWidget {
+  const _CollapsibleLogSection({required this.logs});
+  final List<String> logs;
+
+  @override
+  State<_CollapsibleLogSection> createState() => _CollapsibleLogSectionState();
+}
+
+class _CollapsibleLogSectionState extends State<_CollapsibleLogSection> {
+  bool _isExpanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: () => setState(() => _isExpanded = !_isExpanded),
+          borderRadius: BorderRadius.circular(6),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(
+              children: [
+                Icon(
+                  _isExpanded ? Icons.expand_more : Icons.chevron_right,
+                  size: 16,
+                  color: const Color(0xFF6B7585),
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  'Activity log (${widget.logs.length})',
+                  style: const TextStyle(
+                    color: Color(0xFF6B7585),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (_isExpanded) ...[
+          const SizedBox(height: 4),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: const Color(0xFF2A3038),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final log in widget.logs)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 3),
+                    child: Text(
+                      log,
+                      style: const TextStyle(
+                        color: Color(0xFF9EA5AF),
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                        height: 1.4,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ],
     );
   }
 }

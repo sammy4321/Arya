@@ -172,11 +172,12 @@ Example: {"type": "element_visible", "role": "MenuItem", "label_contains": "New 
         tavilyKey: tavilyKey, webMode: webMode, task: task);
     final attachmentSummary = _formatAttachments(attachments);
 
-    final systemPrompt = '''You are a desktop automation agent. You can SEE the screen via the attached screenshot AND receive a structured list of UI elements from the accessibility tree.
+    final hasScreenshot = screenshotPath != null;
+    final systemPrompt = '''You are a desktop automation agent. You receive a structured list of UI elements parsed from the accessibility tree of the target application.${hasScreenshot ? ' A screenshot is also attached for visual reference.' : ''} Use the element list as your primary source of truth for planning actions.
 
 ## Screen info
 ${jsonEncode(screenContext)}
-Coordinates in the screenshot == mouse coordinates. No scaling needed.
+Element coordinates are in screen pixels matching this region. No scaling needed.
 
 ${_actionsBlock()}
 
@@ -205,7 +206,7 @@ Return ALL steps needed to complete the task from current state to finish. Be th
 Attachments: ${attachmentSummary.isEmpty ? '[none]' : attachmentSummary}
 ${webContext.isNotEmpty ? '\n$webContext' : ''}
 
-Look at the screenshot and UI elements, then produce a COMPLETE plan (JSON array) to accomplish this task.''';
+Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then produce a COMPLETE plan (JSON array) to accomplish this task.''';
 
     return _callAndParsePlan(
       openRouterKey: openRouterKey,
@@ -246,7 +247,7 @@ Look at the screenshot and UI elements, then produce a COMPLETE plan (JSON array
         .map((s) => '  ${s.id}: ${s.title} (${s.action})')
         .join('\n');
 
-    final systemPrompt = '''You are a desktop automation agent. A plan failed at one step. Re-plan from the current state.
+    final systemPrompt = '''You are a desktop automation agent. A plan failed at one step. Re-plan from the current state. A screenshot is attached so you can see the actual screen alongside the UI element list.
 
 ## Screen info
 ${jsonEncode(screenContext)}
@@ -279,7 +280,7 @@ Failure: $failureDetail
 ## Remaining steps that were planned:
 ${remainingDesc.isEmpty ? '[none]' : remainingDesc}
 
-Look at the screenshot and current UI elements. Produce a NEW plan (JSON array) to complete the task from this point.
+Look at the attached screenshot and current UI elements. Produce a NEW plan (JSON array) to complete the task from this point.
 You may retry the failed step differently, skip it, or take a completely different approach.''';
 
     return _callAndParsePlan(

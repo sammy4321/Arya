@@ -29,6 +29,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
   AssistantView _currentView = AssistantView.home;
   final List<ChatMessage> _chatMessages = [];
   bool _isLoading = false;
+  int _takeActionResetKey = 0;
 
   // Predefined menu items for the home screen
   static const List<AssistantMenuItem> _assistantMenuItems = [
@@ -275,7 +276,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
       case AssistantView.guideMe:
         return const GuideMeView();
       case AssistantView.takeAction:
-        return const TakeActionView();
+        return TakeActionView(key: ValueKey(_takeActionResetKey));
       case AssistantView.learnFromMe:
         return const LearnFromMeView();
       case AssistantView.settings:
@@ -377,7 +378,11 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
 
   void _clearChat() {
     setState(() {
-      _chatMessages.clear();
+      if (_currentView == AssistantView.takeAction) {
+        _takeActionResetKey++;
+      } else {
+        _chatMessages.clear();
+      }
     });
   }
 
