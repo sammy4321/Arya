@@ -19,22 +19,10 @@ class HomeView extends StatelessWidget {
       view: AssistantView.chat,
     ),
     _MenuItemData(
-      icon: Icons.lightbulb,
-      title: 'Guide Me',
-      subtitle: 'Step-by-step assistance',
-      view: AssistantView.guideMe,
-    ),
-    _MenuItemData(
       icon: Icons.bolt,
       title: 'Take Action',
       subtitle: 'Automate this task',
       view: AssistantView.takeAction,
-    ),
-    _MenuItemData(
-      icon: Icons.psychology_alt_outlined,
-      title: 'Learn from me',
-      subtitle: 'Teach Arya how to do something',
-      view: AssistantView.learnFromMe,
     ),
   ];
 

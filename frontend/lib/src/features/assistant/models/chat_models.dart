@@ -6,9 +6,7 @@ import 'package:flutter/material.dart';
 enum AssistantView {
   home,
   chat,
-  guideMe,
   takeAction,
-  learnFromMe,
   settings,
 }
 

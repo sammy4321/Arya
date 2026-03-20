@@ -6,9 +6,7 @@ import 'package:arya_app/src/core/window_helpers.dart';
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
 import 'package:arya_app/src/features/assistant/services/ai_service.dart';
 import 'package:arya_app/src/features/assistant/views/chat_view.dart';
-import 'package:arya_app/src/features/assistant/views/guide_me_view.dart';
 import 'package:arya_app/src/features/assistant/views/home_view.dart';
-import 'package:arya_app/src/features/assistant/views/learn_from_me_view.dart';
 import 'package:arya_app/src/features/assistant/views/take_action_view.dart';
 import 'package:arya_app/src/features/assistant/widgets/model_selector.dart';
 import 'package:arya_app/src/features/settings/settings_workspace.dart';
@@ -40,22 +38,10 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
       view: AssistantView.chat,
     ),
     AssistantMenuItem(
-      icon: Icons.lightbulb,
-      title: 'Guide Me',
-      subtitle: 'Step-by-step assistance',
-      view: AssistantView.guideMe,
-    ),
-    AssistantMenuItem(
       icon: Icons.bolt,
       title: 'Take Action',
       subtitle: 'Automate this task',
       view: AssistantView.takeAction,
-    ),
-    AssistantMenuItem(
-      icon: Icons.psychology_alt_outlined,
-      title: 'Learn from me',
-      subtitle: 'Teach Arya how to do something',
-      view: AssistantView.learnFromMe,
     ),
   ];
 
@@ -273,12 +259,8 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
           isLoading: _isLoading,
           onSendMessage: _handleUserMessage,
         );
-      case AssistantView.guideMe:
-        return const GuideMeView();
       case AssistantView.takeAction:
         return TakeActionView(key: ValueKey(_takeActionResetKey));
-      case AssistantView.learnFromMe:
-        return const LearnFromMeView();
       case AssistantView.settings:
         return const SettingsWorkspace();
       case AssistantView.home:
@@ -332,12 +314,8 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
         return 'Agent Assistant';
       case AssistantView.chat:
         return 'Chat';
-      case AssistantView.guideMe:
-        return 'Guide Me';
       case AssistantView.takeAction:
         return 'Take Action';
-      case AssistantView.learnFromMe:
-        return 'Learn from me';
       case AssistantView.settings:
         return 'Settings';
     }

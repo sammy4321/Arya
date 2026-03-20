@@ -21,6 +21,4 @@ export 'widgets/model_selector.dart';
 // Views
 export 'views/home_view.dart';
 export 'views/chat_view.dart';
-export 'views/guide_me_view.dart';
 export 'views/take_action_view.dart';
-export 'views/learn_from_me_view.dart';
