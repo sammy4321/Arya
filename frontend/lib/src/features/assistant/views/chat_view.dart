@@ -6,6 +6,7 @@ import 'package:arya_app/src/features/assistant/widgets/chat_input.dart';
 import 'package:arya_app/src/features/assistant/widgets/chat_message_bubble.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 
 /// The chat view with full messaging functionality.
 ///
@@ -28,6 +29,26 @@ class ChatView extends StatefulWidget {
 }
 
 class _ChatViewState extends State<ChatView> {
+  static const Set<String> _supportedExtensions = {
+    'pdf',
+    'txt',
+    'png',
+    'jpg',
+    'jpeg',
+    'gif',
+    'webp',
+    'bmp',
+  };
+
+  static const Set<String> _imageExtensions = {
+    'png',
+    'jpg',
+    'jpeg',
+    'gif',
+    'webp',
+    'bmp',
+  };
+
   final TextEditingController _controller = TextEditingController();
   final List<ChatAttachment> _pendingAttachments = [];
   bool _isCapturingScreenshot = false;
@@ -41,15 +62,38 @@ class _ChatViewState extends State<ChatView> {
   Future<void> _pickFileFromComputer() async {
     const typeGroup = XTypeGroup(
       label: 'Supported files',
-      extensions: ['pdf', 'txt', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'],
+      extensions: [
+        'pdf',
+        'txt',
+        'png',
+        'jpg',
+        'jpeg',
+        'gif',
+        'webp',
+        'bmp',
+      ],
     );
     final file = await openFile(acceptedTypeGroups: [typeGroup]);
     if (file == null) return;
 
-    final bytes = await file.readAsBytes();
-    final ext = file.name.split('.').last.toLowerCase();
-    final isImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].contains(ext);
+    await _attachXFile(file);
+  }
 
+  Future<void> _attachXFile(XFile file) async {
+    final ext = p.extension(file.name).replaceFirst('.', '').toLowerCase();
+    if (!_supportedExtensions.contains(ext)) {
+      _showAttachmentError('Unsupported file type: ${file.name}');
+      return;
+    }
+
+    final bytes = await file.readAsBytes();
+    if (bytes.isEmpty) {
+      _showAttachmentError('Could not attach empty file: ${file.name}');
+      return;
+    }
+
+    final isImage = _imageExtensions.contains(ext);
+    if (!mounted) return;
     setState(() {
       _pendingAttachments.add(
         ChatAttachment(
@@ -59,6 +103,48 @@ class _ChatViewState extends State<ChatView> {
         ),
       );
     });
+  }
+
+  Future<void> _attachFilesFromPaths(List<String> paths) async {
+    int attachedCount = 0;
+    for (final path in paths) {
+      final file = File(path);
+      if (!await file.exists()) continue;
+
+      final fileName = p.basename(path);
+      final ext = p.extension(fileName).replaceFirst('.', '').toLowerCase();
+      if (!_supportedExtensions.contains(ext)) continue;
+
+      final bytes = await file.readAsBytes();
+      if (bytes.isEmpty) continue;
+
+      attachedCount++;
+      if (!mounted) return;
+      setState(() {
+        _pendingAttachments.add(
+          ChatAttachment(
+            name: fileName,
+            bytes: bytes,
+            isImage: _imageExtensions.contains(ext),
+          ),
+        );
+      });
+    }
+
+    if (attachedCount == 0) {
+      _showAttachmentError('No supported files found in clipboard.');
+    }
+  }
+
+  void _showAttachmentError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   Future<void> _captureAndAttachScreenshot() async {
@@ -174,6 +260,7 @@ class _ChatViewState extends State<ChatView> {
           onAttachmentRemove: _removeAttachment,
           onPickFile: _pickFileFromComputer,
           onScreenshot: _captureAndAttachScreenshot,
+          onPasteFiles: _attachFilesFromPaths,
         ),
       ],
     );

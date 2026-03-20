@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
+import 'package:arya_app/src/features/assistant/services/clipboard_file_service.dart';
 import 'package:arya_app/src/features/assistant/widgets/attachment_strip.dart';
-import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 /// Input field for chat with attachment support and send button.
 class ChatInput extends StatelessWidget {
@@ -13,6 +16,7 @@ class ChatInput extends StatelessWidget {
     required this.onAttachmentRemove,
     required this.onPickFile,
     required this.onScreenshot,
+    required this.onPasteFiles,
     this.isCapturingScreenshot = false,
     super.key,
   });
@@ -25,6 +29,108 @@ class ChatInput extends StatelessWidget {
   final ValueChanged<int> onAttachmentRemove;
   final VoidCallback onPickFile;
   final VoidCallback onScreenshot;
+  final ValueChanged<List<String>> onPasteFiles;
+
+  Future<void> _handlePaste() async {
+    final filePaths = await ClipboardFileService.instance.getClipboardFilePaths();
+    if (filePaths.isNotEmpty) {
+      onPasteFiles(filePaths);
+      return;
+    }
+
+    final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
+    final pastedText = clipboardData?.text;
+    if (pastedText == null || pastedText.isEmpty) return;
+
+    final parsedPaths = await _extractExistingFilePaths(pastedText);
+    if (parsedPaths.isNotEmpty) {
+      onPasteFiles(parsedPaths);
+      return;
+    }
+
+    final value = controller.value;
+    final text = value.text;
+    int start = value.selection.start;
+    int end = value.selection.end;
+
+    if (start < 0 || end < 0) {
+      start = text.length;
+      end = text.length;
+    }
+
+    start = start.clamp(0, text.length).toInt();
+    end = end.clamp(0, text.length).toInt();
+    if (start > end) {
+      final temp = start;
+      start = end;
+      end = temp;
+    }
+
+    final updatedText = text.replaceRange(start, end, pastedText);
+    final cursorOffset = start + pastedText.length;
+    controller.value = TextEditingValue(
+      text: updatedText,
+      selection: TextSelection.collapsed(offset: cursorOffset),
+    );
+  }
+
+  Future<List<String>> _extractExistingFilePaths(String rawText) async {
+    final homeDir = Platform.environment['HOME'];
+    final cwd = Directory.current.absolute;
+    final searchRoots = <Directory>[cwd];
+    var parent = cwd.parent;
+    for (var i = 0; i < 4; i++) {
+      searchRoots.add(parent);
+      if (parent.path == parent.parent.path) break;
+      parent = parent.parent;
+    }
+
+    final candidates = rawText
+        .split(RegExp(r'[\r\n]+'))
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .map((line) {
+          var value = line;
+          if ((value.startsWith('"') && value.endsWith('"')) ||
+              (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.substring(1, value.length - 1);
+          }
+          if (value.startsWith('file://')) {
+            final uri = Uri.tryParse(value);
+            if (uri != null && uri.isScheme('file')) {
+              return uri.toFilePath(windows: false);
+            }
+          }
+          if (value.startsWith('~/') && homeDir != null) {
+            return '$homeDir/${value.substring(2)}';
+          }
+          return value;
+        });
+
+    final existing = <String>[];
+    final seen = <String>{};
+    for (final candidate in candidates) {
+      if (candidate.startsWith('/')) {
+        if (await File(candidate).exists() && seen.add(candidate)) {
+          existing.add(candidate);
+        }
+        continue;
+      }
+
+      // Support IDE "Copy Relative Path" by probing common workspace roots.
+      final relative = candidate.startsWith('./')
+          ? candidate.substring(2)
+          : candidate;
+      for (final root in searchRoots) {
+        final maybePath = '${root.path}/$relative';
+        if (await File(maybePath).exists() && seen.add(maybePath)) {
+          existing.add(maybePath);
+          break;
+        }
+      }
+    }
+    return existing;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -101,28 +207,38 @@ class ChatInput extends StatelessWidget {
                       ),
                       // TextField
                       Expanded(
-                        child: TextField(
-                          controller: controller,
-                          style: const TextStyle(
-                            color: Color(0xFFE8E9EB),
-                            fontSize: 14,
-                          ),
-                          maxLines: 5,
-                          minLines: 1,
-                          textInputAction: TextInputAction.send,
-                          onSubmitted: (_) => isLoading ? null : onSend(),
-                          decoration: const InputDecoration(
-                            hintText: 'Ask me anything...',
-                            hintStyle: TextStyle(
-                              color: Color(0xFF9EA5AF),
+                        child: Actions(
+                          actions: <Type, Action<Intent>>{
+                            PasteTextIntent: CallbackAction<PasteTextIntent>(
+                              onInvoke: (_) {
+                                _handlePaste();
+                                return null;
+                              },
+                            ),
+                          },
+                          child: TextField(
+                            controller: controller,
+                            style: const TextStyle(
+                              color: Color(0xFFE8E9EB),
                               fontSize: 14,
                             ),
-                            border: InputBorder.none,
-                            contentPadding: EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 12,
+                            maxLines: 5,
+                            minLines: 1,
+                            textInputAction: TextInputAction.send,
+                            onSubmitted: (_) => isLoading ? null : onSend(),
+                            decoration: const InputDecoration(
+                              hintText: 'Ask me anything...',
+                              hintStyle: TextStyle(
+                                color: Color(0xFF9EA5AF),
+                                fontSize: 14,
+                              ),
+                              border: InputBorder.none,
+                              contentPadding: EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 12,
+                              ),
+                              isCollapsed: true,
                             ),
-                            isCollapsed: true,
                           ),
                         ),
                       ),
