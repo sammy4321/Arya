@@ -5,16 +5,18 @@ import 'package:flutter/material.dart';
 class AttachmentStrip extends StatelessWidget {
   const AttachmentStrip({
     required this.attachments,
+    required this.loadingFileNames,
     required this.onRemove,
     super.key,
   });
 
   final List<ChatAttachment> attachments;
+  final List<String> loadingFileNames;
   final ValueChanged<int> onRemove;
 
   @override
   Widget build(BuildContext context) {
-    if (attachments.isEmpty) {
+    if (attachments.isEmpty && loadingFileNames.isEmpty) {
       return const SizedBox.shrink();
     }
 
@@ -23,44 +25,82 @@ class AttachmentStrip extends StatelessWidget {
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
         child: Row(
-          children: attachments.asMap().entries.map((entry) {
-            final index = entry.key;
-            final attachment = entry.value;
-            return Padding(
-              padding: const EdgeInsets.only(right: 6),
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 8,
-                  vertical: 5,
-                ),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF4E5661),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      attachment.name,
-                      style: const TextStyle(
-                        color: Color(0xFFD2D8DF),
-                        fontSize: 12,
+          children: [
+            ...loadingFileNames.map((fileName) {
+              return Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF424B56),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const SizedBox(
+                        width: 11,
+                        height: 11,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.8,
+                          color: Color(0xFFB7C0CC),
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 6),
-                    GestureDetector(
-                      onTap: () => onRemove(index),
-                      child: const Icon(
-                        Icons.close,
-                        size: 12,
-                        color: Color(0xFF9EA5AF),
+                      const SizedBox(width: 6),
+                      Text(
+                        fileName,
+                        style: const TextStyle(
+                          color: Color(0xFFD2D8DF),
+                          fontSize: 12,
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            );
-          }).toList(),
+              );
+            }),
+            ...attachments.asMap().entries.map((entry) {
+              final index = entry.key;
+              final attachment = entry.value;
+              return Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF4E5661),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        attachment.name,
+                        style: const TextStyle(
+                          color: Color(0xFFD2D8DF),
+                          fontSize: 12,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      GestureDetector(
+                        onTap: () => onRemove(index),
+                        child: const Icon(
+                          Icons.close,
+                          size: 12,
+                          color: Color(0xFF9EA5AF),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+          ],
         ),
       ),
     );
@@ -69,10 +109,7 @@ class AttachmentStrip extends StatelessWidget {
 
 /// Displays attachments within a chat message bubble.
 class MessageAttachmentDisplay extends StatelessWidget {
-  const MessageAttachmentDisplay({
-    required this.attachments,
-    super.key,
-  });
+  const MessageAttachmentDisplay({required this.attachments, super.key});
 
   final List<ChatAttachment> attachments;
 
@@ -98,10 +135,7 @@ class MessageAttachmentDisplay extends StatelessWidget {
           );
         }
         return Container(
-          padding: const EdgeInsets.symmetric(
-            horizontal: 8,
-            vertical: 5,
-          ),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
           decoration: BoxDecoration(
             color: Colors.white.withValues(alpha: 0.15),
             borderRadius: BorderRadius.circular(6),
@@ -118,10 +152,7 @@ class MessageAttachmentDisplay extends StatelessWidget {
               Flexible(
                 child: Text(
                   a.name,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                  ),
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
