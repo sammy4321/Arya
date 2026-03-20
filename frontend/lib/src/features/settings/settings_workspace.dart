@@ -195,9 +195,8 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
         true,
         visibleOnFullScreen: true,
       );
-    } else {
-      await windowManager.setAlwaysOnTop(true);
     }
+    await windowManager.setAlwaysOnTop(true);
     await windowManager.focus();
   }
 

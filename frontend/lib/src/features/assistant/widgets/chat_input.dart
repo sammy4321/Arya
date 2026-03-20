@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
 import 'package:arya_app/src/features/assistant/services/clipboard_file_service.dart';
 import 'package:arya_app/src/features/assistant/widgets/attachment_strip.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -17,6 +18,7 @@ class ChatInput extends StatelessWidget {
     required this.onPickFile,
     required this.onScreenshot,
     required this.onPasteFiles,
+    required this.onDropFiles,
     this.isCapturingScreenshot = false,
     super.key,
   });
@@ -30,6 +32,7 @@ class ChatInput extends StatelessWidget {
   final VoidCallback onPickFile;
   final VoidCallback onScreenshot;
   final ValueChanged<List<String>> onPasteFiles;
+  final ValueChanged<List<String>> onDropFiles;
 
   Future<void> _handlePaste() async {
     final filePaths = await ClipboardFileService.instance.getClipboardFilePaths();
@@ -134,127 +137,138 @@ class ChatInput extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: const BoxDecoration(
-        color: Color(0xFF4E5661),
-        borderRadius: BorderRadius.vertical(
-          bottom: Radius.circular(11),
+    return DropTarget(
+      onDragDone: (details) {
+        final droppedPaths = details.files
+            .map((item) => item.path)
+            .where((path) => path.isNotEmpty)
+            .toList();
+        if (droppedPaths.isNotEmpty) {
+          onDropFiles(droppedPaths);
+        }
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: const BoxDecoration(
+          color: Color(0xFF4E5661),
+          borderRadius: BorderRadius.vertical(
+            bottom: Radius.circular(11),
+          ),
         ),
-      ),
-      child: Row(
-        children: [
-          // Text input field with icons inside
-          Expanded(
-            child: Container(
-              constraints: const BoxConstraints(
-                maxHeight: 200,
-              ),
-              decoration: BoxDecoration(
-                color: const Color(0xFF373E47),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  AttachmentStrip(
-                    attachments: attachments,
-                    onRemove: onAttachmentRemove,
-                  ),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      // Plus icon for file attachment
-                      Padding(
-                        padding: const EdgeInsets.only(left: 8),
-                        child: Tooltip(
-                          message: 'Attach file',
-                          child: InkWell(
-                            onTap: onPickFile,
-                            borderRadius: BorderRadius.circular(8),
-                            child: const Icon(
-                              Icons.add,
-                              color: Color(0xFFD2D8DF),
-                              size: 20,
+        child: Row(
+          children: [
+            // Text input field with icons inside
+            Expanded(
+              child: Container(
+                constraints: const BoxConstraints(
+                  maxHeight: 200,
+                ),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF373E47),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    AttachmentStrip(
+                      attachments: attachments,
+                      onRemove: onAttachmentRemove,
+                    ),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        // Plus icon for file attachment
+                        Padding(
+                          padding: const EdgeInsets.only(left: 8),
+                          child: Tooltip(
+                            message: 'Attach file',
+                            child: InkWell(
+                              onTap: onPickFile,
+                              borderRadius: BorderRadius.circular(8),
+                              child: const Icon(
+                                Icons.add,
+                                color: Color(0xFFD2D8DF),
+                                size: 20,
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                      // Screenshot icon
-                      Padding(
-                        padding: const EdgeInsets.only(left: 8),
-                        child: Tooltip(
-                          message: 'Attach screenshot',
-                          child: InkWell(
-                            onTap: isCapturingScreenshot ? null : onScreenshot,
-                            borderRadius: BorderRadius.circular(8),
-                            child: isCapturingScreenshot
-                                ? const SizedBox(
-                                    width: 18,
-                                    height: 18,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
+                        // Screenshot icon
+                        Padding(
+                          padding: const EdgeInsets.only(left: 8),
+                          child: Tooltip(
+                            message: 'Attach screenshot',
+                            child: InkWell(
+                              onTap: isCapturingScreenshot ? null : onScreenshot,
+                              borderRadius: BorderRadius.circular(8),
+                              child: isCapturingScreenshot
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Color(0xFFD2D8DF),
+                                      ),
+                                    )
+                                  : const Icon(
+                                      Icons.screenshot_monitor,
                                       color: Color(0xFFD2D8DF),
+                                      size: 18,
                                     ),
-                                  )
-                                : const Icon(
-                                    Icons.screenshot_monitor,
-                                    color: Color(0xFFD2D8DF),
-                                    size: 18,
-                                  ),
+                            ),
                           ),
                         ),
-                      ),
-                      // TextField
-                      Expanded(
-                        child: Actions(
-                          actions: <Type, Action<Intent>>{
-                            PasteTextIntent: CallbackAction<PasteTextIntent>(
-                              onInvoke: (_) {
-                                _handlePaste();
-                                return null;
-                              },
-                            ),
-                          },
-                          child: TextField(
-                            controller: controller,
-                            style: const TextStyle(
-                              color: Color(0xFFE8E9EB),
-                              fontSize: 14,
-                            ),
-                            maxLines: 5,
-                            minLines: 1,
-                            textInputAction: TextInputAction.send,
-                            onSubmitted: (_) => isLoading ? null : onSend(),
-                            decoration: const InputDecoration(
-                              hintText: 'Ask me anything...',
-                              hintStyle: TextStyle(
-                                color: Color(0xFF9EA5AF),
+                        // TextField
+                        Expanded(
+                          child: Actions(
+                            actions: <Type, Action<Intent>>{
+                              PasteTextIntent: CallbackAction<PasteTextIntent>(
+                                onInvoke: (_) {
+                                  _handlePaste();
+                                  return null;
+                                },
+                              ),
+                            },
+                            child: TextField(
+                              controller: controller,
+                              style: const TextStyle(
+                                color: Color(0xFFE8E9EB),
                                 fontSize: 14,
                               ),
-                              border: InputBorder.none,
-                              contentPadding: EdgeInsets.symmetric(
-                                horizontal: 12,
-                                vertical: 12,
+                              maxLines: 5,
+                              minLines: 1,
+                              textInputAction: TextInputAction.send,
+                              onSubmitted: (_) => isLoading ? null : onSend(),
+                              decoration: const InputDecoration(
+                                hintText: 'Ask me anything...',
+                                hintStyle: TextStyle(
+                                  color: Color(0xFF9EA5AF),
+                                  fontSize: 14,
+                                ),
+                                border: InputBorder.none,
+                                contentPadding: EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 12,
+                                ),
+                                isCollapsed: true,
                               ),
-                              isCollapsed: true,
                             ),
                           ),
                         ),
-                      ),
-                    ],
-                  ),
-                ],
+                      ],
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-          const SizedBox(width: 8),
-          // Submit/Send icon
-          _SendButton(
-            isLoading: isLoading,
-            onTap: onSend,
-          ),
-        ],
+            const SizedBox(width: 8),
+            // Submit/Send icon
+            _SendButton(
+              isLoading: isLoading,
+              onTap: onSend,
+            ),
+          ],
+        ),
       ),
     );
   }

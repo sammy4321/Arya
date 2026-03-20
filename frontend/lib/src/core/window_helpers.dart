@@ -72,9 +72,7 @@ Future<void> configureDesktopWindow() async {
 
   await windowManager.waitUntilReadyToShow(options);
   await windowManager.setAsFrameless();
-  if (!Platform.isMacOS) {
-    await windowManager.setAlwaysOnTop(true);
-  }
+  await windowManager.setAlwaysOnTop(true);
   await windowManager.setResizable(false);
   await windowManager.setMinimizable(false);
   await windowManager.setMaximizable(false);

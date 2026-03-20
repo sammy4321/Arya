@@ -44,6 +44,7 @@ dependencies:
   pdfrx: ^1.0.71
   flutter_markdown: ^0.7.6
   nutdart: ^0.0.1
+  desktop_drop: ^0.7.0
 
 dev_dependencies:
   flutter_test:

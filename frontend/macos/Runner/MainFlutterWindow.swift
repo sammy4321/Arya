@@ -24,8 +24,8 @@ class MainFlutterWindow: NSPanel {
     self.backgroundColor = .clear
     self.hasShadow = false
     self.hidesOnDeactivate = false
-    self.level = .screenSaver
-    self.styleMask.insert(.nonactivatingPanel)
+    self.level = .floating
+    self.styleMask.remove(.nonactivatingPanel)
     self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
     flutterViewController.view.wantsLayer = true

@@ -261,6 +261,7 @@ class _ChatViewState extends State<ChatView> {
           onPickFile: _pickFileFromComputer,
           onScreenshot: _captureAndAttachScreenshot,
           onPasteFiles: _attachFilesFromPaths,
+          onDropFiles: _attachFilesFromPaths,
         ),
       ],
     );
