@@ -8,7 +8,9 @@ import 'package:arya_app/src/features/assistant/services/attachment_policy.dart'
 import 'package:arya_app/src/features/assistant/services/action_executor_service.dart';
 import 'package:arya_app/src/features/assistant/services/screenshot_service.dart';
 import 'package:arya_app/src/features/assistant/services/step_planner.dart';
+import 'package:arya_app/src/features/assistant/services/task_strategy_planner.dart';
 import 'package:arya_app/src/features/assistant/services/ui_parser_service.dart';
+import 'package:arya_app/src/features/assistant/widgets/copy_button.dart';
 import 'package:arya_app/src/features/settings/ai_settings_store.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -25,8 +27,10 @@ class TakeActionView extends StatefulWidget {
 
 class _TakeActionViewState extends State<TakeActionView> {
   final _controller = TextEditingController();
+  final FocusNode _inputFocusNode = FocusNode();
   bool _isLoading = false;
   bool _isPlanning = false;
+  bool _isEditingTask = false;
   String _webMode = 'auto';
   String? _abortReason;
   String? _taskText;
@@ -35,15 +39,25 @@ class _TakeActionViewState extends State<TakeActionView> {
   final List<_ActionStep> _steps = [];
   final List<String> _logs = [];
   final List<PlannerTrace> _plannerTraces = [];
+  String _latestPlannerReasoning = '';
+  bool _isPlannerThinking = false;
+  bool _isThinkingModelSelected = false;
   String? _latestScreenshotPath;
   List<UIElement> _latestUIElements = [];
   int? _targetAppPid;
   late final StepPlanner _planner;
+  late final TaskStrategyPlanner _strategyPlanner;
+  StrategyResult? _activeStrategy;
+  String _resolvedAppName = '';
 
   @override
   void initState() {
     super.initState();
-    _planner = StepPlanner(traceLogger: _recordPlannerTrace);
+    _planner = StepPlanner(
+      traceLogger: _recordPlannerTrace,
+      reasoningLogger: _onPlannerReasoningUpdate,
+    );
+    _strategyPlanner = TaskStrategyPlanner();
     UIParserService.instance.warmUp();
     ActionExecutorService.instance.warmUp();
   }
@@ -51,6 +65,7 @@ class _TakeActionViewState extends State<TakeActionView> {
   @override
   void dispose() {
     _controller.dispose();
+    _inputFocusNode.dispose();
     super.dispose();
   }
 
@@ -72,14 +87,20 @@ class _TakeActionViewState extends State<TakeActionView> {
       _taskText = text;
       _isLoading = true;
       _isPlanning = false;
+      _isEditingTask = false;
+      _isThinkingModelSelected = _looksLikeThinkingModel(model);
       _steps.clear();
       _logs.clear();
       _plannerTraces.clear();
+      _latestPlannerReasoning = '';
+      _isPlannerThinking = false;
       _capturedScreenshots.clear();
       _abortReason = null;
       _pendingAttachments.clear();
       _latestScreenshotPath = null;
       _targetAppPid = null;
+      _activeStrategy = null;
+      _resolvedAppName = '';
       ActionExecutorService.instance.targetAppPid = null;
     });
     _controller.clear();
@@ -87,6 +108,41 @@ class _TakeActionViewState extends State<TakeActionView> {
     await _runPlanBasedLoop(task: text, model: model, attachments: attachments);
 
     if (mounted) setState(() => _isLoading = false);
+  }
+
+  void _stopExecution() {
+    if (!_isLoading) return;
+    final lastTask = _taskText ?? '';
+    setState(() {
+      _isLoading = false;
+      _isPlanning = false;
+      if (lastTask.isNotEmpty) {
+        _controller.value = TextEditingValue(
+          text: lastTask,
+          selection: TextSelection.collapsed(offset: lastTask.length),
+        );
+      }
+      _logs.add('Stopped by user.');
+    });
+  }
+
+  void _editCurrentTask() {
+    final task = _taskText?.trim() ?? '';
+    if (task.isEmpty || _isLoading) return;
+    _controller.value = TextEditingValue(
+      text: task,
+      selection: TextSelection.collapsed(offset: task.length),
+    );
+    setState(() => _isEditingTask = true);
+    _inputFocusNode.requestFocus();
+  }
+
+  void _cancelTaskEditMode() {
+    if (_isLoading) return;
+    setState(() {
+      _isEditingTask = false;
+      _controller.clear();
+    });
   }
 
   // =========================================================================
@@ -139,10 +195,32 @@ class _TakeActionViewState extends State<TakeActionView> {
     // --- Phase 1: Initial capture (UI elements only) + full plan ---
     if (mounted) setState(() => _isPlanning = true);
     await _captureContext('Initial context', region: captureRegion);
-    final plannerScreenContext = {
-      ...screenContext,
-      ...await _buildTargetAppContext(),
-    };
+    final appContext = await _buildTargetAppContext();
+    final plannerScreenContext = {...screenContext, ...appContext};
+    _resolvedAppName =
+        (appContext['target_app_name'] as String?)?.trim().toLowerCase() ?? '';
+
+    // Strategy resolution — cache probe → LLM fallback.
+    String strategyHint = '';
+    try {
+      final strategy = await _strategyPlanner.resolve(
+        openRouterKey: openRouterKey,
+        model: model,
+        task: task,
+        appName: _resolvedAppName,
+      );
+      if (strategy != null) {
+        _activeStrategy = strategy;
+        strategyHint = strategy.bestApproachText;
+        _log(
+          'Strategy resolved (${strategy.source}): '
+          'pattern="${strategy.taskPattern}" '
+          'approach="${strategyHint.length > 80 ? '${strategyHint.substring(0, 80)}…' : strategyHint}"',
+        );
+      }
+    } catch (e) {
+      debugPrint('[Strategy] Error during resolve: $e');
+    }
 
     _log('Generating plan…');
     List<PlannedStep> plan;
@@ -157,6 +235,7 @@ class _TakeActionViewState extends State<TakeActionView> {
         tavilyKey: tavilyKey,
         webMode: _webMode,
         attachments: attachmentMaps,
+        strategyHint: strategyHint,
       );
     } catch (e) {
       if (mounted) setState(() => _isPlanning = false);
@@ -219,6 +298,7 @@ class _TakeActionViewState extends State<TakeActionView> {
 
           if (replansUsed >= _maxReplans) {
             _setAbort('Max re-plans ($replansUsed) exhausted.');
+            _recordStrategyOutcome(success: false);
             return;
           }
           plan = await _replan(
@@ -271,6 +351,7 @@ class _TakeActionViewState extends State<TakeActionView> {
         _log('✗ Verify FAILED: ${step.verify}');
         if (replansUsed >= _maxReplans) {
           _setAbort('Verification failed and max re-plans exhausted.');
+          _recordStrategyOutcome(success: false);
           return;
         }
 
@@ -314,6 +395,7 @@ class _TakeActionViewState extends State<TakeActionView> {
 
       if (plan.isEmpty) {
         _log('✓ Task verified as complete.');
+        _recordStrategyOutcome(success: true);
         break;
       }
 
@@ -324,6 +406,7 @@ class _TakeActionViewState extends State<TakeActionView> {
 
     if (totalSteps >= _maxSteps) {
       _log('Reached maximum step limit ($_maxSteps).');
+      _recordStrategyOutcome(success: false);
     }
   }
 
@@ -693,7 +776,54 @@ class _TakeActionViewState extends State<TakeActionView> {
 
   void _recordPlannerTrace(PlannerTrace trace) {
     if (!mounted) return;
-    setState(() => _plannerTraces.add(trace));
+    setState(() {
+      _plannerTraces.add(trace);
+      if (trace.reasoning.trim().isNotEmpty) {
+        _latestPlannerReasoning = trace.reasoning.trim();
+      }
+    });
+  }
+
+  void _onPlannerReasoningUpdate(String label, String reasoning, bool done) {
+    if (!mounted) return;
+    setState(() {
+      _isPlannerThinking = !done;
+      if (reasoning.trim().isNotEmpty) {
+        _latestPlannerReasoning = reasoning.trim();
+      }
+    });
+  }
+
+  void _recordStrategyOutcome({required bool success}) {
+    final strategy = _activeStrategy;
+    if (strategy == null || _resolvedAppName.isEmpty) return;
+    if (success) {
+      _strategyPlanner.recordSuccess(
+        appName: _resolvedAppName,
+        taskPattern: strategy.taskPattern,
+      );
+      _log('Strategy "${strategy.taskPattern}" marked as successful.');
+    } else {
+      _strategyPlanner.recordFailure(
+        appName: _resolvedAppName,
+        taskPattern: strategy.taskPattern,
+      );
+      _log('Strategy "${strategy.taskPattern}" marked as failed.');
+    }
+  }
+
+  bool _looksLikeThinkingModel(String model) {
+    final m = model.toLowerCase();
+    const hints = <String>[
+      'thinking',
+      'reason',
+      'r1',
+      '/o1',
+      '/o3',
+      '/o4',
+      'grok-',
+    ];
+    return hints.any(m.contains);
   }
 
   Future<Map<String, dynamic>> _buildTargetAppContext() async {
@@ -794,6 +924,11 @@ class _TakeActionViewState extends State<TakeActionView> {
           ),
         ),
         _buildControlsRow(),
+        if (_isEditingTask)
+          _EditTaskModeBanner(
+            isLoading: _isLoading,
+            onCancel: _cancelTaskEditMode,
+          ),
         _buildInput(),
       ],
     );
@@ -860,11 +995,29 @@ class _TakeActionViewState extends State<TakeActionView> {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         children: [
           if (_taskText != null) ...[
-            _TaskBubble(text: _taskText!),
+            _TaskBubbleWithActions(
+              text: _taskText!,
+              canEdit: !_isLoading,
+              onEdit: _editCurrentTask,
+            ),
             const SizedBox(height: 16),
+          ],
+          if (_activeStrategy != null) ...[
+            _StrategyBadge(strategy: _activeStrategy!),
+            const SizedBox(height: 8),
           ],
           if (_isPlanning) ...[
             const _PlanningIndicator(),
+            const SizedBox(height: 12),
+          ],
+          if (_isThinkingModelSelected &&
+              (_isPlanning ||
+                  _isPlannerThinking ||
+                  _latestPlannerReasoning.isNotEmpty)) ...[
+            _PlannerReasoningBanner(
+              isThinking: _isPlanning || _isPlannerThinking,
+              reasoning: _latestPlannerReasoning,
+            ),
             const SizedBox(height: 12),
           ],
           if (_steps.isNotEmpty)
@@ -936,6 +1089,7 @@ class _TakeActionViewState extends State<TakeActionView> {
                   Expanded(
                     child: TextField(
                       controller: _controller,
+                      focusNode: _inputFocusNode,
                       style: const TextStyle(
                         color: Color(0xFFE8E9EB),
                         fontSize: 14,
@@ -965,34 +1119,62 @@ class _TakeActionViewState extends State<TakeActionView> {
             ),
           ),
           const SizedBox(width: 8),
-          Container(
-            width: 36,
-            height: 36,
-            decoration: BoxDecoration(
-              color: _isLoading
-                  ? const Color(0xFF677281)
-                  : const Color(0xFF1F80E9),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: InkWell(
-              onTap: _isLoading ? null : () => unawaited(_submit()),
-              borderRadius: BorderRadius.circular(12),
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  if (!_isLoading)
-                    const Icon(Icons.send, color: Colors.white, size: 18),
-                  if (_isLoading)
-                    const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
+          Tooltip(
+            message: _isLoading ? 'Stop current task' : 'Run task',
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 160),
+              switchInCurve: Curves.easeOut,
+              switchOutCurve: Curves.easeIn,
+              child: _isLoading
+                  ? InkWell(
+                      key: const ValueKey('take_action_loading_stop_button'),
+                      onTap: _stopExecution,
+                      borderRadius: BorderRadius.circular(20),
+                      child: SizedBox(
+                        width: 38,
+                        height: 38,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            const SizedBox(
+                              width: 38,
+                              height: 38,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.2,
+                                color: Color(0xFF9CC8FF),
+                              ),
+                            ),
+                            Container(
+                              width: 30,
+                              height: 30,
+                              decoration: const BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Color(0xFF5F6C7B),
+                              ),
+                              child: const Icon(
+                                Icons.stop_rounded,
+                                color: Colors.white,
+                                size: 16,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    )
+                  : InkWell(
+                      key: const ValueKey('take_action_idle_send_button'),
+                      onTap: () => unawaited(_submit()),
+                      borderRadius: BorderRadius.circular(12),
+                      child: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1F80E9),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Icon(Icons.send, color: Colors.white, size: 18),
                       ),
                     ),
-                ],
-              ),
             ),
           ),
         ],
@@ -1049,25 +1231,130 @@ class _TaskBubble extends StatelessWidget {
     return Align(
       alignment: Alignment.centerRight,
       child: Container(
-        constraints: const BoxConstraints(maxWidth: 320),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.7,
+        ),
+        padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
-          color: const Color(0xFF1F80E9).withValues(alpha: 0.12),
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(16),
-            topRight: Radius.circular(4),
-            bottomLeft: Radius.circular(16),
-            bottomRight: Radius.circular(16),
-          ),
+          color: const Color(0xFF1F80E9),
+          borderRadius: BorderRadius.circular(12),
         ),
         child: Text(
           text,
           style: const TextStyle(
-            color: Color(0xFFE8E9EB),
-            fontSize: 13,
-            height: 1.4,
+            color: Colors.white,
+            fontSize: 14,
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _TaskBubbleWithActions extends StatelessWidget {
+  const _TaskBubbleWithActions({
+    required this.text,
+    required this.canEdit,
+    required this.onEdit,
+  });
+
+  final String text;
+  final bool canEdit;
+  final VoidCallback onEdit;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerRight,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _TaskBubble(text: text),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                onPressed: canEdit ? onEdit : null,
+                iconSize: 14,
+                padding: const EdgeInsets.all(4),
+                constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+                color: const Color(0xFFB8C1CC),
+                disabledColor: const Color(0xFF6D7682),
+                tooltip: canEdit ? 'Edit task' : 'Running',
+                style: IconButton.styleFrom(
+                  splashFactory: NoSplash.splashFactory,
+                  highlightColor: Colors.transparent,
+                  hoverColor: Colors.transparent,
+                ),
+                icon: const Icon(Icons.edit_outlined),
+              ),
+              const SizedBox(width: 2),
+              CopyButton(
+                textToCopy: text,
+                iconColor: const Color(0xFFB8C1CC),
+                copiedIconColor: const Color(0xFFD2D8DF),
+                size: 14,
+                tooltip: 'Copy Message',
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StrategyBadge extends StatelessWidget {
+  const _StrategyBadge({required this.strategy});
+
+  final StrategyResult strategy;
+
+  @override
+  Widget build(BuildContext context) {
+    final isCached = strategy.source == 'cache';
+    final icon = isCached ? Icons.cached : Icons.auto_awesome_outlined;
+    final label = isCached ? 'Cached strategy' : 'New strategy';
+    final pattern = strategy.taskPattern;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A3441),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: isCached
+              ? const Color(0xFF4E886B)
+              : const Color(0xFF4E6288),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            icon,
+            size: 14,
+            color: isCached
+                ? const Color(0xFF81C784)
+                : const Color(0xFF90CAF9),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '$label: "$pattern"',
+              style: TextStyle(
+                color: isCached
+                    ? const Color(0xFF81C784)
+                    : const Color(0xFF90CAF9),
+                fontSize: 11.5,
+                fontWeight: FontWeight.w500,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1098,6 +1385,152 @@ class _PlanningIndicator extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _PlannerReasoningBanner extends StatefulWidget {
+  const _PlannerReasoningBanner({
+    required this.isThinking,
+    required this.reasoning,
+  });
+
+  final bool isThinking;
+  final String reasoning;
+
+  @override
+  State<_PlannerReasoningBanner> createState() => _PlannerReasoningBannerState();
+}
+
+class _PlannerReasoningBannerState extends State<_PlannerReasoningBanner> {
+  bool _expanded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _expanded = widget.isThinking || widget.reasoning.isNotEmpty;
+  }
+
+  @override
+  void didUpdateWidget(covariant _PlannerReasoningBanner oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isThinking && !_expanded) {
+      setState(() => _expanded = true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasReasoning = widget.reasoning.trim().isNotEmpty;
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: const Color(0xFF303845),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF4E5661)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            borderRadius: BorderRadius.circular(10),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              child: Row(
+                children: [
+                  Icon(
+                    _expanded ? Icons.expand_more : Icons.chevron_right,
+                    size: 16,
+                    color: const Color(0xFFD2D8DF),
+                  ),
+                  const SizedBox(width: 4),
+                  const Icon(
+                    Icons.psychology_alt_outlined,
+                    size: 15,
+                    color: Color(0xFFD2D8DF),
+                  ),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'Planner thinking',
+                    style: TextStyle(
+                      color: Color(0xFFD2D8DF),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (widget.isThinking) ...[
+                    const SizedBox(width: 8),
+                    const SizedBox(
+                      width: 11,
+                      height: 11,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.7,
+                        color: Color(0xFFD2D8DF),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (_expanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+              child: Text(
+                hasReasoning
+                    ? widget.reasoning
+                    : (widget.isThinking
+                          ? 'Thinking through the next best action plan...'
+                          : 'No reasoning returned by the model.'),
+                style: const TextStyle(
+                  color: Color(0xFFD2D8DF),
+                  fontSize: 12,
+                  height: 1.35,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EditTaskModeBanner extends StatelessWidget {
+  const _EditTaskModeBanner({required this.isLoading, required this.onCancel});
+
+  final bool isLoading;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      color: const Color(0xFF313945),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Row(
+        children: [
+          const Icon(Icons.edit_note, size: 16, color: Color(0xFFD2D8DF)),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text(
+              'Editing task. Press send to run the updated task.',
+              style: TextStyle(color: Color(0xFFD2D8DF), fontSize: 12),
+            ),
+          ),
+          IconButton(
+            onPressed: isLoading ? null : onCancel,
+            iconSize: 16,
+            tooltip: 'Cancel edit',
+            color: const Color(0xFFE8E9EB),
+            disabledColor: const Color(0xFF7A838F),
+            constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+            padding: const EdgeInsets.all(4),
+            splashRadius: 14,
+            icon: const Icon(Icons.close),
+          ),
+        ],
+      ),
     );
   }
 }

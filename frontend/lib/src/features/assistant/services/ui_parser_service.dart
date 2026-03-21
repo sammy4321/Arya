@@ -12,6 +12,8 @@ class UIElement {
     this.title = '',
     this.value = '',
     this.description = '',
+    this.parentId,
+    this.depth = 0,
     required this.x,
     required this.y,
     required this.width,
@@ -23,6 +25,8 @@ class UIElement {
   final String title;
   final String value;
   final String description;
+  final int? parentId;
+  final int depth;
   final int x;
   final int y;
   final int width;
@@ -46,6 +50,8 @@ class UIElement {
     if (description.isNotEmpty && description != title) {
       parts.add('desc="$description"');
     }
+    parts.add('depth=$depth');
+    if (parentId != null) parts.add('parent=$parentId');
     parts.add('@ ($centerX, $centerY)');
     parts.add('size=${width}x$height');
     return parts.join(' ');
@@ -53,16 +59,26 @@ class UIElement {
 
   factory UIElement.fromJson(Map<String, dynamic> json) {
     return UIElement(
-      id: json['id'] as int? ?? 0,
+      id: _intFrom(json['id']) ?? 0,
       role: json['role'] as String? ?? '',
       title: json['title'] as String? ?? '',
       value: json['value'] as String? ?? '',
       description: json['desc'] as String? ?? '',
-      x: json['x'] as int? ?? 0,
-      y: json['y'] as int? ?? 0,
-      width: json['w'] as int? ?? 0,
-      height: json['h'] as int? ?? 0,
+      parentId: _intFrom(json['parent_id']),
+      depth: _intFrom(json['depth']) ?? 0,
+      x: _intFrom(json['x']) ?? 0,
+      y: _intFrom(json['y']) ?? 0,
+      width: _intFrom(json['w']) ?? 0,
+      height: _intFrom(json['h']) ?? 0,
     );
+  }
+
+  static int? _intFrom(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw);
+    return null;
   }
 }
 
@@ -70,12 +86,40 @@ class UIElement {
 String formatUIElementsForPrompt(List<UIElement> elements) {
   if (elements.isEmpty) return '';
   final lines = elements.map((e) => e.toPromptLine()).join('\n');
+  final graphLines = _formatHierarchyGraph(elements);
   return '''
 ## UI Elements visible on screen
 Elements are listed with center coordinates (use these for precise clicking).
-Format: [id] Role "label" @ (center_x, center_y) size=WxH
+Format: [id] Role "label" depth=D parent=P @ (center_x, center_y) size=WxH
 
-$lines''';
+$lines
+
+## UI hierarchy graph (parent -> children)
+$graphLines''';
+}
+
+String _formatHierarchyGraph(List<UIElement> elements) {
+  if (elements.isEmpty) return '[empty]';
+  final byParent = <int?, List<int>>{};
+  for (final el in elements) {
+    byParent.putIfAbsent(el.parentId, () => <int>[]).add(el.id);
+  }
+  for (final ids in byParent.values) {
+    ids.sort();
+  }
+
+  final roots = byParent[null] ?? const <int>[];
+  final lines = <String>[
+    roots.isEmpty ? 'roots: [none]' : 'roots: ${roots.map((id) => '[$id]').join(', ')}',
+  ];
+
+  final parentIds = byParent.keys.whereType<int>().toList()..sort();
+  for (final parentId in parentIds) {
+    final children = byParent[parentId] ?? const <int>[];
+    if (children.isEmpty) continue;
+    lines.add('[$parentId] -> ${children.map((id) => '[$id]').join(', ')}');
+  }
+  return lines.join('\n');
 }
 
 /// Parses the UI of the frontmost application using macOS Accessibility APIs.
@@ -167,22 +211,7 @@ class UIParserService {
       }
 
       elements.sort(_interactivePriority);
-
-      // Re-assign sequential IDs after filtering.
-      elements = [
-        for (var i = 0; i < elements.length; i++)
-          UIElement(
-            id: i + 1,
-            role: elements[i].role,
-            title: elements[i].title,
-            value: elements[i].value,
-            description: elements[i].description,
-            x: elements[i].x,
-            y: elements[i].y,
-            width: elements[i].width,
-            height: elements[i].height,
-          ),
-      ];
+      elements = _fillMissingHierarchy(_reindexAndRelink(elements));
 
       debugPrint('[UIParser] Parsed ${elements.length} elements '
           '(pid=${targetPid ?? "frontmost"})');
@@ -219,6 +248,8 @@ class UIParserService {
         title: el.title,
         value: el.value,
         description: el.description,
+        parentId: el.parentId,
+        depth: el.depth,
         x: el.x - region.x,
         y: el.y - region.y,
         width: el.width,
@@ -226,6 +257,131 @@ class UIParserService {
       ));
     }
     return result;
+  }
+
+  List<UIElement> _reindexAndRelink(List<UIElement> elements) {
+    if (elements.isEmpty) return elements;
+    final oldToNew = <int, int>{};
+    for (var i = 0; i < elements.length; i++) {
+      oldToNew[elements[i].id] = i + 1;
+    }
+
+    return [
+      for (final el in elements)
+        UIElement(
+          id: oldToNew[el.id]!,
+          role: el.role,
+          title: el.title,
+          value: el.value,
+          description: el.description,
+          parentId: el.parentId != null ? oldToNew[el.parentId!] : null,
+          depth: el.depth,
+          x: el.x,
+          y: el.y,
+          width: el.width,
+          height: el.height,
+        ),
+    ];
+  }
+
+  static const _containerLikeRoles = {
+    'Window',
+    'Dialog',
+    'Sheet',
+    'Group',
+    'ScrollArea',
+    'SplitGroup',
+    'Toolbar',
+    'List',
+    'Table',
+    'Row',
+    'Outline',
+    'WebArea',
+    'TabGroup',
+    'MenuBar',
+    'LayoutArea',
+    'Browser',
+    'Menu',
+  };
+
+  List<UIElement> _fillMissingHierarchy(List<UIElement> elements) {
+    if (elements.isEmpty) return elements;
+    final byId = <int, UIElement>{for (final e in elements) e.id: e};
+    final parentById = <int, int?>{
+      for (final e in elements) e.id: e.parentId,
+    };
+
+    for (final child in elements) {
+      if (parentById[child.id] != null) continue;
+      int? bestParent;
+      var bestArea = 0x7fffffff;
+      for (final candidate in elements) {
+        if (candidate.id == child.id) continue;
+        if (!_containerLikeRoles.contains(candidate.role)) continue;
+        if (!_contains(candidate, child)) continue;
+        final area = candidate.width * candidate.height;
+        if (area <= 0) continue;
+        if (area < bestArea) {
+          bestArea = area;
+          bestParent = candidate.id;
+        }
+      }
+      if (bestParent != null) {
+        parentById[child.id] = bestParent;
+      }
+    }
+
+    final depthById = <int, int>{};
+    int computeDepth(int id, Set<int> path) {
+      final cached = depthById[id];
+      if (cached != null) return cached;
+      if (path.contains(id)) return 0;
+      final parent = parentById[id];
+      if (parent == null || !byId.containsKey(parent)) {
+        depthById[id] = 0;
+        return 0;
+      }
+      final nextPath = <int>{...path, id};
+      final depth = computeDepth(parent, nextPath) + 1;
+      depthById[id] = depth;
+      return depth;
+    }
+
+    return [
+      for (final e in elements)
+        UIElement(
+          id: e.id,
+          role: e.role,
+          title: e.title,
+          value: e.value,
+          description: e.description,
+          parentId: parentById[e.id],
+          depth: computeDepth(e.id, <int>{}),
+          x: e.x,
+          y: e.y,
+          width: e.width,
+          height: e.height,
+        ),
+    ];
+  }
+
+  bool _contains(UIElement outer, UIElement inner) {
+    const pad = 2;
+    final outerLeft = outer.x - pad;
+    final outerTop = outer.y - pad;
+    final outerRight = outer.x + outer.width + pad;
+    final outerBottom = outer.y + outer.height + pad;
+    final innerLeft = inner.x;
+    final innerTop = inner.y;
+    final innerRight = inner.x + inner.width;
+    final innerBottom = inner.y + inner.height;
+    final strictlyLarger =
+        outer.width * outer.height > inner.width * inner.height;
+    if (!strictlyLarger) return false;
+    return innerLeft >= outerLeft &&
+        innerTop >= outerTop &&
+        innerRight <= outerRight &&
+        innerBottom <= outerBottom;
   }
 
   /// Filters out noise: empty StaticText, tiny icon-spacer elements, etc.
@@ -276,8 +432,8 @@ class UIParserService {
     }
 
     final cacheDir = '${Directory.systemTemp.path}/arya_ui_parser';
-    final binaryPath = '$cacheDir/ui_parser_v7';
-    final sourcePath = '$cacheDir/ui_parser_v7.swift';
+    final binaryPath = '$cacheDir/ui_parser_v8';
+    final sourcePath = '$cacheDir/ui_parser_v8.swift';
 
     if (await File(binaryPath).exists()) {
       _cachedBinaryPath = binaryPath;
@@ -413,7 +569,7 @@ let containerRoles: Set<String> = [
     "AXTabGroup", "AXMenuBar", "AXLayoutArea", "AXBrowser"
 ]
 
-func ser(_ el: AXUIElement, _ d: Int) -> [[String: Any]] {
+func ser(_ el: AXUIElement, _ d: Int, _ parentEmittedId: Int?) -> [[String: Any]] {
     if d > 25 || eid >= maxEls { return [] }
     var r: [[String: Any]] = []
 
@@ -452,6 +608,7 @@ func ser(_ el: AXUIElement, _ d: Int) -> [[String: Any]] {
         w = Int(sz.width); h = Int(sz.height)
     }
 
+    var emittedId: Int? = nil
     if w > 3 && h > 3 {
         let labeled = !title.isEmpty || !desc.isEmpty || !valStr.isEmpty
         let isInteractive = interactiveRoles.contains(role)
@@ -463,11 +620,14 @@ func ser(_ el: AXUIElement, _ d: Int) -> [[String: Any]] {
                          (isContainer && labeled)
         if shouldEmit {
             eid += 1
+            emittedId = eid
             var entry: [String: Any] = [
-                "id": eid,
+                "id": emittedId!,
                 "role": role.hasPrefix("AX") ? String(role.dropFirst(2)) : role,
-                "x": x, "y": y, "w": w, "h": h
+                "x": x, "y": y, "w": w, "h": h,
+                "depth": d
             ]
+            if let p = parentEmittedId { entry["parent_id"] = p }
             if !title.isEmpty { entry["title"] = title }
             if !valStr.isEmpty { entry["value"] = valStr }
             if !desc.isEmpty { entry["desc"] = desc }
@@ -479,9 +639,10 @@ func ser(_ el: AXUIElement, _ d: Int) -> [[String: Any]] {
     var chRef: AnyObject?
     AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &chRef)
     if let children = chRef as? [AXUIElement] {
+        let nextParent = emittedId ?? parentEmittedId
         for child in children {
             if eid >= maxEls { break }
-            r.append(contentsOf: ser(child, d + 1))
+            r.append(contentsOf: ser(child, d + 1, nextParent))
         }
     }
     return r
@@ -497,7 +658,7 @@ if CommandLine.arguments.count > 1, let pid = Int32(CommandLine.arguments[1]) {
     targetPid = app.processIdentifier
 }
 let el = AXUIElementCreateApplication(targetPid)
-let result = ser(el, 0)
+let result = ser(el, 0, nil)
 if let data = try? JSONSerialization.data(withJSONObject: result),
    let str = String(data: data, encoding: .utf8) {
     print(str)

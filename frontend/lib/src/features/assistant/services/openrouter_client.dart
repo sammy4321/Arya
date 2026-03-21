@@ -9,6 +9,13 @@ class OpenRouterStreamChunk {
   final String reasoningDelta;
 }
 
+class OpenRouterCompletion {
+  const OpenRouterCompletion({this.content = '', this.reasoning = ''});
+
+  final String content;
+  final String reasoning;
+}
+
 /// Direct Dart client for the OpenRouter chat completions API.
 class OpenRouterClient {
   static const _baseUrl = 'https://openrouter.ai/api/v1/chat/completions';
@@ -18,6 +25,21 @@ class OpenRouterClient {
     required String model,
     required List<Map<String, dynamic>> messages,
   }) async {
+    final completion = await chatCompletionDetailed(
+      apiKey: apiKey,
+      model: model,
+      messages: messages,
+      includeReasoning: false,
+    );
+    return completion.content;
+  }
+
+  Future<OpenRouterCompletion> chatCompletionDetailed({
+    required String apiKey,
+    required String model,
+    required List<Map<String, dynamic>> messages,
+    bool includeReasoning = false,
+  }) async {
     final response = await http
         .post(
           Uri.parse(_baseUrl),
@@ -25,7 +47,11 @@ class OpenRouterClient {
             'Authorization': 'Bearer $apiKey',
             'Content-Type': 'application/json',
           },
-          body: jsonEncode({'model': model, 'messages': messages}),
+          body: jsonEncode({
+            'model': model,
+            'messages': messages,
+            if (includeReasoning) 'include_reasoning': true,
+          }),
         )
         .timeout(const Duration(seconds: 60));
 
@@ -35,10 +61,16 @@ class OpenRouterClient {
 
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
     final choices = payload['choices'] as List<dynamic>? ?? [];
-    if (choices.isEmpty) return '';
+    if (choices.isEmpty) return const OpenRouterCompletion();
     final message =
         (choices.first as Map<String, dynamic>)['message'] as Map<String, dynamic>? ?? {};
-    return (message['content'] as String?) ?? '';
+    final content = _extractText(message['content'] ?? message['text']);
+    final reasoning = _extractText(
+      message['reasoning'] ??
+          message['reasoning_content'] ??
+          message['reasoning_text'],
+    );
+    return OpenRouterCompletion(content: content, reasoning: reasoning);
   }
 
   Stream<OpenRouterStreamChunk> chatCompletionStream({
@@ -48,6 +80,7 @@ class OpenRouterClient {
   }) async* {
     final client = http.Client();
     try {
+      var lastReasoningSnapshot = '';
       final request = http.Request('POST', Uri.parse(_baseUrl))
         ..headers.addAll({
           'Authorization': 'Bearer $apiKey',
@@ -93,16 +126,32 @@ class OpenRouterClient {
         if (choice is! Map<String, dynamic>) continue;
 
         final delta = choice['delta'];
-        if (delta is! Map<String, dynamic>) continue;
+        final deltaMap = delta is Map<String, dynamic> ? delta : const <String, dynamic>{};
+        final contentDelta = _extractText(
+          deltaMap['content'] ?? deltaMap['text'],
+        );
 
-        final contentDelta = _extractDeltaText(
-          delta['content'] ?? delta['text'],
+        var reasoningDelta = _extractText(
+          deltaMap['reasoning'] ??
+              deltaMap['reasoning_content'] ??
+              deltaMap['reasoning_text'] ??
+              choice['reasoning'] ??
+              choice['reasoning_content'] ??
+              choice['reasoning_text'] ??
+              payload['reasoning'] ??
+              payload['reasoning_content'] ??
+              payload['reasoning_text'],
         );
-        final reasoningDelta = _extractDeltaText(
-          delta['reasoning'] ??
-              delta['reasoning_content'] ??
-              delta['reasoning_text'],
-        );
+        // Some providers stream cumulative reasoning snapshots instead of deltas.
+        // Convert snapshots to true deltas to avoid re-appending full text.
+        if (reasoningDelta.isNotEmpty) {
+          if (reasoningDelta.startsWith(lastReasoningSnapshot)) {
+            reasoningDelta = reasoningDelta.substring(lastReasoningSnapshot.length);
+            lastReasoningSnapshot = '$lastReasoningSnapshot$reasoningDelta';
+          } else {
+            lastReasoningSnapshot = '$lastReasoningSnapshot$reasoningDelta';
+          }
+        }
         if (contentDelta.isEmpty && reasoningDelta.isEmpty) continue;
         yield OpenRouterStreamChunk(
           contentDelta: contentDelta,
@@ -114,7 +163,7 @@ class OpenRouterClient {
     }
   }
 
-  static String _extractDeltaText(dynamic raw) {
+  static String _extractText(dynamic raw) {
     if (raw == null) return '';
     if (raw is String) return raw;
     if (raw is List) {

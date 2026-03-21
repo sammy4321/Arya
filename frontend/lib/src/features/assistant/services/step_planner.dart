@@ -17,6 +17,7 @@ class PlannerTrace {
     required this.userPrompt,
     required this.requestPayload,
     required this.rawResponse,
+    required this.reasoning,
   });
 
   final String label;
@@ -26,9 +27,12 @@ class PlannerTrace {
   final String userPrompt;
   final String requestPayload;
   final String rawResponse;
+  final String reasoning;
 }
 
 typedef PlannerTraceLogger = void Function(PlannerTrace trace);
+typedef PlannerReasoningLogger =
+    void Function(String label, String reasoning, bool done);
 
 // ---------------------------------------------------------------------------
 // Verification criteria — checked locally after each step (no LLM call).
@@ -138,13 +142,16 @@ class StepPlanner {
     OpenRouterClient? openRouterClient,
     TavilyClient? tavilyClient,
     PlannerTraceLogger? traceLogger,
+    PlannerReasoningLogger? reasoningLogger,
   }) : _traceLogger = traceLogger,
+       _reasoningLogger = reasoningLogger,
        _openRouter = openRouterClient ?? OpenRouterClient(),
        _tavily = tavilyClient ?? TavilyClient();
 
   final OpenRouterClient _openRouter;
   final TavilyClient _tavily;
   final PlannerTraceLogger? _traceLogger;
+  final PlannerReasoningLogger? _reasoningLogger;
 
   // Shared prompt fragments ------------------------------------------------
 
@@ -191,6 +198,17 @@ Example: {"type": "text_visible", "label_contains": "first few words"}
 Example: {"type": "element_visible", "role": "MenuItem", "label_contains": "New File"}
 Example: {"type": "element_gone", "role": "Button", "label_contains": "Commit"}''';
 
+  static String _hierarchyBlock() => '''
+## UI hierarchy usage
+You receive BOTH:
+- A flat actionable list (element id, role, label, coordinates)
+- A parent->children hierarchy graph
+
+Use hierarchy to improve disambiguation:
+- Prefer elements within the same parent container as related labels.
+- For menus/dialogs, validate the parent chain matches expected context.
+- If duplicate labels exist, choose the element whose role + parent context best fits the task.''';
+
   // -----------------------------------------------------------------------
   // generateFullPlan — one LLM call, returns all steps.
   // -----------------------------------------------------------------------
@@ -205,6 +223,7 @@ Example: {"type": "element_gone", "role": "Button", "label_contains": "Commit"}'
     String tavilyKey = '',
     String webMode = 'auto',
     List<Map<String, dynamic>> attachments = const [],
+    String strategyHint = '',
   }) async {
     _validateKeys(openRouterKey, model);
 
@@ -237,8 +256,10 @@ ${_thenBlock()}
 
 ${_verifyBlock()}
 
-${_safetyBlock()}
+${_hierarchyBlock()}
 
+${_safetyBlock()}
+${strategyHint.isNotEmpty ? '\n## Recommended strategy\nThe following high-level approach has been identified as effective for this type of task. Use it as guidance when constructing your step-by-step plan:\n$strategyHint\n' : ''}
 ${uiContext.isNotEmpty ? '\n$uiContext\n' : ''}
 ## Response format — return ONLY a JSON array:
 [
@@ -314,6 +335,8 @@ ${_thenBlock()}
 
 ${_verifyBlock()}
 
+${_hierarchyBlock()}
+
 ${_safetyBlock()}
 
 ${uiContext.isNotEmpty ? '\n$uiContext\n' : ''}
@@ -382,11 +405,40 @@ Look at the current UI elements${screenshotPath != null ? ' and attached screens
     final logPayload = _sanitizePayloadForLog(requestPayload);
     debugPrint('[Planner:$label] REQUEST_PAYLOAD=${jsonEncode(logPayload)}');
 
-    final raw = await _openRouter.chatCompletion(
+    final responseBuffer = StringBuffer();
+    final reasoningBuffer = StringBuffer();
+    _reasoningLogger?.call(label, '', false);
+    await for (final chunk in _openRouter.chatCompletionStream(
       apiKey: openRouterKey,
       model: model,
       messages: requestMessages,
-    );
+    )) {
+      if (chunk.contentDelta.isNotEmpty) {
+        responseBuffer.write(chunk.contentDelta);
+      }
+      if (chunk.reasoningDelta.isNotEmpty) {
+        reasoningBuffer.write(chunk.reasoningDelta);
+        _reasoningLogger?.call(label, reasoningBuffer.toString(), false);
+      }
+    }
+
+    var raw = responseBuffer.toString();
+    var reasoning = reasoningBuffer.toString();
+    // Fallback for providers/models that don't return SSE deltas reliably.
+    if (raw.trim().isEmpty) {
+      final completion = await _openRouter.chatCompletionDetailed(
+        apiKey: openRouterKey,
+        model: model,
+        messages: requestMessages,
+        includeReasoning: true,
+      );
+      raw = completion.content;
+      if (reasoning.trim().isEmpty) {
+        reasoning = completion.reasoning;
+      }
+    }
+    _reasoningLogger?.call(label, reasoning, true);
+
     _traceLogger?.call(
       PlannerTrace(
         label: label,
@@ -396,6 +448,7 @@ Look at the current UI elements${screenshotPath != null ? ' and attached screens
         userPrompt: userPrompt,
         requestPayload: jsonEncode(logPayload),
         rawResponse: raw,
+        reasoning: reasoning,
       ),
     );
 
