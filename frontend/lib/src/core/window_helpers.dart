@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:arya_app/src/core/app_constants.dart';
@@ -6,43 +5,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:screen_retriever/screen_retriever.dart';
 import 'package:window_manager/window_manager.dart';
-
-class SubWindowLaunch {
-  const SubWindowLaunch({required this.windowId, required this.arguments});
-
-  final int windowId;
-  final Map<String, dynamic> arguments;
-}
-
-SubWindowLaunch? parseSubWindowLaunch(List<String> args) {
-  final markerIndex = args.indexOf('multi_window');
-  if (markerIndex == -1 || markerIndex + 1 >= args.length) {
-    return null;
-  }
-
-  final windowId = int.tryParse(args[markerIndex + 1]);
-  if (windowId == null) {
-    return null;
-  }
-
-  var arguments = <String, dynamic>{};
-  if (markerIndex + 2 < args.length && args[markerIndex + 2].isNotEmpty) {
-    try {
-      final decoded = jsonDecode(args[markerIndex + 2]);
-      if (decoded is Map<String, dynamic>) {
-        arguments = decoded;
-      } else if (decoded is Map) {
-        arguments = decoded.map(
-          (key, value) => MapEntry(key.toString(), value),
-        );
-      }
-    } catch (_) {
-      // Ignore malformed payloads; window id is enough to launch subwindow UI.
-    }
-  }
-
-  return SubWindowLaunch(windowId: windowId, arguments: arguments);
-}
 
 bool get supportsDesktopWindowControls {
   if (isFlutterTest || kIsWeb) {

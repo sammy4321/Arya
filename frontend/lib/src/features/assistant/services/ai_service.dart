@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
+import 'package:arya_app/src/features/assistant/services/ai_validation.dart';
 import 'package:arya_app/src/features/assistant/services/chat_orchestrator.dart';
 import 'package:arya_app/src/features/settings/ai_settings_store.dart';
 import 'package:pdfrx/pdfrx.dart';
@@ -21,12 +22,16 @@ class AiService {
     final tavilyKey = await store.getTavilyApiKey();
     final model = await store.getModel();
 
-    if (model.isEmpty) {
+    final configIssue = getOpenRouterConfigIssue(
+      apiKey: openRouterKey,
+      model: model,
+    );
+    if (configIssue == OpenRouterConfigIssue.missingModel) {
       throw const AiException(
         'Please select a model before sending a message.',
       );
     }
-    if (openRouterKey.isEmpty) {
+    if (configIssue == OpenRouterConfigIssue.missingApiKey) {
       throw const AiException(
         'OpenRouter API key is missing. Set it in Settings.',
       );
@@ -121,10 +126,7 @@ class AiService {
       pdfText = '[Could not extract PDF text: $e]';
     }
 
-    return {
-      'type': 'text',
-      'text': 'File: ${attachment.name}\n\n$pdfText',
-    };
+    return {'type': 'text', 'text': 'File: ${attachment.name}\n\n$pdfText'};
   }
 
   Map<String, dynamic> _formatTextFileAttachment(ChatAttachment attachment) {
@@ -135,10 +137,7 @@ class AiService {
       fileText = '[Could not decode file content]';
     }
 
-    return {
-      'type': 'text',
-      'text': 'File: ${attachment.name}\n\n$fileText',
-    };
+    return {'type': 'text', 'text': 'File: ${attachment.name}\n\n$fileText'};
   }
 }
 

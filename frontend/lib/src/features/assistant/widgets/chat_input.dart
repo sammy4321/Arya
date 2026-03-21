@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 class ChatInput extends StatelessWidget {
   const ChatInput({
     required this.controller,
+    required this.focusNode,
     required this.attachments,
     required this.loadingFileNames,
     required this.isLoading,
@@ -23,6 +24,7 @@ class ChatInput extends StatelessWidget {
   });
 
   final TextEditingController controller;
+  final FocusNode focusNode;
   final List<ChatAttachment> attachments;
   final List<String> loadingFileNames;
   final bool isLoading;
@@ -218,6 +220,7 @@ class ChatInput extends StatelessWidget {
                           },
                           child: TextField(
                             controller: controller,
+                            focusNode: focusNode,
                             style: const TextStyle(
                               color: Color(0xFFE8E9EB),
                               fontSize: 14,

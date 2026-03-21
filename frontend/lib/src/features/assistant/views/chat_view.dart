@@ -1,9 +1,11 @@
 import 'dart:io';
 
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
+import 'package:arya_app/src/features/assistant/services/attachment_policy.dart';
 import 'package:arya_app/src/features/assistant/services/screenshot_service.dart';
 import 'package:arya_app/src/features/assistant/widgets/chat_input.dart';
 import 'package:arya_app/src/features/assistant/widgets/chat_message_bubble.dart';
+import 'package:arya_app/src/features/assistant/widgets/copy_button.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -18,41 +20,25 @@ class ChatView extends StatefulWidget {
     required this.messages,
     required this.isLoading,
     required this.onSendMessage,
+    required this.onEditUserMessage,
     super.key,
   });
 
   final List<ChatMessage> messages;
   final bool isLoading;
   final ValueChanged<ChatMessage> onSendMessage;
+  final Future<void> Function(int index, String newContent) onEditUserMessage;
 
   @override
   State<ChatView> createState() => _ChatViewState();
 }
 
 class _ChatViewState extends State<ChatView> {
-  static const Set<String> _supportedExtensions = {
-    'pdf',
-    'txt',
-    'png',
-    'jpg',
-    'jpeg',
-    'gif',
-    'webp',
-    'bmp',
-  };
-
-  static const Set<String> _imageExtensions = {
-    'png',
-    'jpg',
-    'jpeg',
-    'gif',
-    'webp',
-    'bmp',
-  };
-
   final TextEditingController _controller = TextEditingController();
+  final FocusNode _inputFocusNode = FocusNode();
   final List<ChatAttachment> _pendingAttachments = [];
   final List<String> _loadingAttachmentNames = [];
+  int? _editingMessageIndex;
   bool _isCapturingScreenshot = false;
   bool _isDragOver = false;
   bool _isAttachingFiles = false;
@@ -60,13 +46,39 @@ class _ChatViewState extends State<ChatView> {
   @override
   void dispose() {
     _controller.dispose();
+    _inputFocusNode.dispose();
     super.dispose();
+  }
+
+  void _startEditingMessage(int index) {
+    final message = widget.messages[index];
+    final text = message.content;
+    setState(() {
+      _controller.value = TextEditingValue(
+        text: text,
+        selection: TextSelection.collapsed(offset: text.length),
+      );
+      _pendingAttachments.clear();
+      _editingMessageIndex = index;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _inputFocusNode.requestFocus();
+    });
+  }
+
+  void _cancelEditingMessage() {
+    setState(() {
+      _controller.clear();
+      _pendingAttachments.clear();
+      _editingMessageIndex = null;
+    });
   }
 
   Future<void> _pickFileFromComputer() async {
     const typeGroup = XTypeGroup(
       label: 'Supported files',
-      extensions: ['pdf', 'txt', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'],
+      extensions: [...supportedAttachmentExtensions],
     );
     final file = await openFile(acceptedTypeGroups: [typeGroup]);
     if (file == null) return;
@@ -80,8 +92,7 @@ class _ChatViewState extends State<ChatView> {
     await Future<void>.delayed(Duration.zero);
 
     _markFileLoading(file.name);
-    final ext = p.extension(file.name).replaceFirst('.', '').toLowerCase();
-    if (!_supportedExtensions.contains(ext)) {
+    if (!isSupportedAttachmentFile(file.name)) {
       _showAttachmentError('Unsupported file type: ${file.name}');
       _clearFileLoading(file.name);
       if (mounted) {
@@ -100,7 +111,7 @@ class _ChatViewState extends State<ChatView> {
       return;
     }
 
-    final isImage = _imageExtensions.contains(ext);
+    final isImage = isImageAttachmentFile(file.name);
     if (!mounted) return;
     setState(() {
       _pendingAttachments.add(
@@ -124,8 +135,7 @@ class _ChatViewState extends State<ChatView> {
 
         final fileName = p.basename(path);
         _markFileLoading(fileName);
-        final ext = p.extension(fileName).replaceFirst('.', '').toLowerCase();
-        if (!_supportedExtensions.contains(ext)) {
+        if (!isSupportedAttachmentFile(fileName)) {
           _clearFileLoading(fileName);
           continue;
         }
@@ -143,7 +153,7 @@ class _ChatViewState extends State<ChatView> {
             ChatAttachment(
               name: fileName,
               bytes: bytes,
-              isImage: _imageExtensions.contains(ext),
+              isImage: isImageAttachmentFile(fileName),
             ),
           );
           _removeFirstLoadingByName(fileName);
@@ -310,13 +320,27 @@ class _ChatViewState extends State<ChatView> {
 
   void _sendMessage() {
     if (_isAttachingFiles) return;
-    final message = _controller.text.trim();
-    if (message.isEmpty && _pendingAttachments.isEmpty) return;
+    final text = _controller.text.trim();
+    final editingIndex = _editingMessageIndex;
+
+    if (editingIndex != null) {
+      final original = widget.messages[editingIndex];
+      if (text.isEmpty && original.attachments.isEmpty) return;
+      if (text == original.content) {
+        _cancelEditingMessage();
+        return;
+      }
+      widget.onEditUserMessage(editingIndex, text);
+      _controller.clear();
+      setState(() => _editingMessageIndex = null);
+      return;
+    }
+
+    if (text.isEmpty && _pendingAttachments.isEmpty) return;
 
     final attachments = List<ChatAttachment>.from(_pendingAttachments);
-
     widget.onSendMessage(
-      ChatMessage(content: message, isUser: true, attachments: attachments),
+      ChatMessage(content: text, isUser: true, attachments: attachments),
     );
 
     _controller.clear();
@@ -363,7 +387,12 @@ class _ChatViewState extends State<ChatView> {
                               child: Row(
                                 children: [
                                   if (message.isUser)
-                                    UserMessageBubble(message: message)
+                                    _UserMessageWithEditControl(
+                                      message: message,
+                                      isEditing: _editingMessageIndex == index,
+                                      canEdit: !widget.isLoading,
+                                      onEdit: () => _startEditingMessage(index),
+                                    )
                                   else
                                     AssistantMessageBubble(message: message),
                                 ],
@@ -374,8 +403,14 @@ class _ChatViewState extends State<ChatView> {
                 ),
               ),
               _buildAttachLoader(),
+              if (_editingMessageIndex != null)
+                _EditModeBanner(
+                  isLoading: widget.isLoading,
+                  onCancel: _cancelEditingMessage,
+                ),
               ChatInput(
                 controller: _controller,
+                focusNode: _inputFocusNode,
                 attachments: _pendingAttachments,
                 loadingFileNames: _loadingAttachmentNames,
                 isLoading: widget.isLoading || _isAttachingFiles,
@@ -389,6 +424,106 @@ class _ChatViewState extends State<ChatView> {
             ],
           ),
           _buildDragOverlay(),
+        ],
+      ),
+    );
+  }
+}
+
+class _UserMessageWithEditControl extends StatelessWidget {
+  const _UserMessageWithEditControl({
+    required this.message,
+    required this.isEditing,
+    required this.canEdit,
+    required this.onEdit,
+  });
+
+  final ChatMessage message;
+  final bool isEditing;
+  final bool canEdit;
+  final VoidCallback onEdit;
+
+  @override
+  Widget build(BuildContext context) {
+    return Flexible(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          UserMessageBubble(message: message),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                onPressed: canEdit && !isEditing ? onEdit : null,
+                iconSize: 14,
+                padding: const EdgeInsets.all(4),
+                constraints: const BoxConstraints(
+                  minWidth: 22,
+                  minHeight: 22,
+                ),
+                color: const Color(0xFFB8C1CC),
+                disabledColor: const Color(0xFF6D7682),
+                tooltip: isEditing ? 'Editing' : 'Edit message',
+                style: IconButton.styleFrom(
+                  splashFactory: NoSplash.splashFactory,
+                  highlightColor: Colors.transparent,
+                  hoverColor: Colors.transparent,
+                ),
+                icon: const Icon(Icons.edit_outlined),
+              ),
+              if (message.content.isNotEmpty) ...[
+                const SizedBox(width: 2),
+                CopyButton(
+                  textToCopy: message.content,
+                  iconColor: const Color(0xFFB8C1CC),
+                  copiedIconColor: const Color(0xFFD2D8DF),
+                  size: 14,
+                  tooltip: 'Copy Message',
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EditModeBanner extends StatelessWidget {
+  const _EditModeBanner({required this.isLoading, required this.onCancel});
+
+  final bool isLoading;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      color: const Color(0xFF313945),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Row(
+        children: [
+          const Icon(Icons.edit_note, size: 16, color: Color(0xFFD2D8DF)),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text(
+              'Editing message. Press send in input to regenerate from here.',
+              style: TextStyle(color: Color(0xFFD2D8DF), fontSize: 12),
+            ),
+          ),
+          IconButton(
+            onPressed: isLoading ? null : onCancel,
+            iconSize: 16,
+            tooltip: 'Cancel edit',
+            color: const Color(0xFFE8E9EB),
+            disabledColor: const Color(0xFF7A838F),
+            constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+            padding: const EdgeInsets.all(4),
+            splashRadius: 14,
+            icon: const Icon(Icons.close),
+          ),
         ],
       ),
     );

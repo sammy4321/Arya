@@ -1,6 +1,3 @@
-import 'dart:convert';
-import 'dart:io';
-
 import 'package:arya_app/src/core/app_constants.dart';
 import 'package:arya_app/src/core/window_helpers.dart';
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
@@ -62,77 +59,78 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
                   crossAxisAlignment: CrossAxisAlignment.end,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 180),
-                    switchInCurve: Curves.easeOut,
-                    switchOutCurve: Curves.easeIn,
-                    child: _isWindowOpen
-                        ? MediaQuery(
-                            data: MediaQuery.of(context).copyWith(
-                              textScaler: TextScaler.noScaling,
-                            ),
-                            child: Container(
-                              key: const ValueKey('popup'),
-                              width: _currentView == AssistantView.home
-                                  ? assistantHomePopupWidth
-                                  : (MediaQuery.of(context).size.width - 32)
-                                      .clamp(
-                                        assistantHomePopupWidth,
-                                        _currentView == AssistantView.settings
-                                            ? assistantSettingsPopupWidth
-                                            : assistantDetailPopupWidth,
-                                      ),
-                              height: _currentView == AssistantView.home
-                                  ? null
-                                  : (MediaQuery.of(context).size.height - 96)
-                                      .clamp(
-                                        0.0,
-                                        MediaQuery.of(context).size.height,
-                                      ),
-                              margin: const EdgeInsets.only(bottom: 12),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(12),
-                                child: ColoredBox(
-                                  color: const Color(0xFF47505A),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    mainAxisSize: _currentView ==
-                                            AssistantView.home
-                                        ? MainAxisSize.min
-                                        : MainAxisSize.max,
-                                    children: [
-                                      _buildHeader(),
-                                      const Divider(
-                                        height: 1,
-                                        color: Color(0xFF5B626C),
-                                      ),
-                                      _currentView == AssistantView.home
-                                          ? _buildHomeContent()
-                                          : Expanded(
-                                              child: _buildCurrentView(),
-                                            ),
-                                      if (_currentView == AssistantView.home)
-                                        _buildFooter(),
-                                    ],
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 180),
+                      switchInCurve: Curves.easeOut,
+                      switchOutCurve: Curves.easeIn,
+                      child: _isWindowOpen
+                          ? MediaQuery(
+                              data: MediaQuery.of(
+                                context,
+                              ).copyWith(textScaler: TextScaler.noScaling),
+                              child: Container(
+                                key: const ValueKey('popup'),
+                                width: _currentView == AssistantView.home
+                                    ? assistantHomePopupWidth
+                                    : (MediaQuery.of(context).size.width - 32)
+                                          .clamp(
+                                            assistantHomePopupWidth,
+                                            _currentView ==
+                                                    AssistantView.settings
+                                                ? assistantSettingsPopupWidth
+                                                : assistantDetailPopupWidth,
+                                          ),
+                                height: _currentView == AssistantView.home
+                                    ? null
+                                    : (MediaQuery.of(context).size.height - 96)
+                                          .clamp(
+                                            0.0,
+                                            MediaQuery.of(context).size.height,
+                                          ),
+                                margin: const EdgeInsets.only(bottom: 12),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(12),
+                                  child: ColoredBox(
+                                    color: const Color(0xFF47505A),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      mainAxisSize:
+                                          _currentView == AssistantView.home
+                                          ? MainAxisSize.min
+                                          : MainAxisSize.max,
+                                      children: [
+                                        _buildHeader(),
+                                        const Divider(
+                                          height: 1,
+                                          color: Color(0xFF5B626C),
+                                        ),
+                                        _currentView == AssistantView.home
+                                            ? _buildHomeContent()
+                                            : Expanded(
+                                                child: _buildCurrentView(),
+                                              ),
+                                        if (_currentView == AssistantView.home)
+                                          _buildFooter(),
+                                      ],
+                                    ),
                                   ),
                                 ),
                               ),
-                            ),
-                          )
-                        : const SizedBox.shrink(key: ValueKey('empty')),
-                  ),
-                  FloatingActionButton(
-                    onPressed: _toggleWindow,
-                    tooltip: '',
-                    backgroundColor: const Color(0xFF1F80E9),
-                    foregroundColor: Colors.white,
-                    child: Icon(
-                      _isWindowOpen
-                          ? Icons.close
-                          : Icons.auto_awesome_rounded,
+                            )
+                          : const SizedBox.shrink(key: ValueKey('empty')),
                     ),
-                  ),
+                    FloatingActionButton(
+                      onPressed: _toggleWindow,
+                      tooltip: '',
+                      backgroundColor: const Color(0xFF1F80E9),
+                      foregroundColor: Colors.white,
+                      child: Icon(
+                        _isWindowOpen
+                            ? Icons.close
+                            : Icons.auto_awesome_rounded,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -152,11 +150,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
         child: Row(
           children: [
             if (_currentView == AssistantView.home) ...[
-              const Icon(
-                Icons.circle,
-                color: Color(0xFF1F7ACF),
-                size: 9,
-              ),
+              const Icon(Icons.circle, color: Color(0xFF1F7ACF), size: 9),
               const SizedBox(width: 10),
               Text(
                 _getViewTitle(_currentView),
@@ -219,15 +213,18 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
                           _currentView == AssistantView.takeAction)
                         Align(
                           alignment: Alignment.centerRight,
-                          child: InkWell(
-                            onTap: _clearChat,
-                            borderRadius: BorderRadius.circular(8),
-                            child: const Padding(
-                              padding: EdgeInsets.all(6),
-                              child: Icon(
-                                Icons.refresh,
-                                size: 16,
-                                color: Color(0xFFD2D8DF),
+                          child: Tooltip(
+                            message: 'Start New Chat',
+                            child: InkWell(
+                              onTap: _clearChat,
+                              borderRadius: BorderRadius.circular(8),
+                              child: const Padding(
+                                padding: EdgeInsets.all(6),
+                                child: Icon(
+                                  Icons.refresh,
+                                  size: 16,
+                                  color: Color(0xFFD2D8DF),
+                                ),
                               ),
                             ),
                           ),
@@ -246,9 +243,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
   static void _noopModelSelected(String _) {}
 
   Widget _buildHomeContent() {
-    return HomeView(
-      onViewSelected: _openView,
-    );
+    return HomeView(onViewSelected: _openView);
   }
 
   Widget _buildCurrentView() {
@@ -258,6 +253,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
           messages: _chatMessages,
           isLoading: _isLoading,
           onSendMessage: _handleUserMessage,
+          onEditUserMessage: _handleEditUserMessage,
         );
       case AssistantView.takeAction:
         return TakeActionView(key: ValueKey(_takeActionResetKey));
@@ -271,24 +267,16 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
   Widget _buildFooter() {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(
-        horizontal: 12,
-        vertical: 10,
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: const BoxDecoration(
         color: Color(0xFF4E5661),
-        borderRadius: BorderRadius.vertical(
-          bottom: Radius.circular(11),
-        ),
+        borderRadius: BorderRadius.vertical(bottom: Radius.circular(11)),
       ),
       child: Row(
         children: [
           const Text(
             'Powered by AgentOS',
-            style: TextStyle(
-              color: Color(0xFFA4AAB2),
-              fontSize: 10.5,
-            ),
+            style: TextStyle(color: Color(0xFFA4AAB2), fontSize: 10.5),
           ),
           const Spacer(),
           InkWell(
@@ -296,11 +284,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
             borderRadius: BorderRadius.circular(14),
             child: const Padding(
               padding: EdgeInsets.all(4),
-              child: Icon(
-                Icons.settings,
-                size: 15,
-                color: Color(0xFFA4AAB2),
-              ),
+              child: Icon(Icons.settings, size: 15, color: Color(0xFFA4AAB2)),
             ),
           ),
         ],
@@ -346,9 +330,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
 
   Future<void> _goBackToHome() async {
     if (supportsDesktopWindowControls) {
-      await resizeWindowKeepingBottomRightAnchor(
-        await _getHomeWindowSize(),
-      );
+      await resizeWindowKeepingBottomRightAnchor(await _getHomeWindowSize());
     }
     if (!mounted) return;
     setState(() => _currentView = AssistantView.home);
@@ -370,6 +352,34 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
       _isLoading = true;
     });
 
+    await _requestAssistantReply();
+  }
+
+  Future<void> _handleEditUserMessage(int index, String newContent) async {
+    if (_isLoading) return;
+    if (index < 0 || index >= _chatMessages.length) return;
+
+    final original = _chatMessages[index];
+    if (!original.isUser) return;
+
+    final edited = ChatMessage(
+      content: newContent,
+      isUser: true,
+      attachments: original.attachments,
+    );
+    final truncated = <ChatMessage>[..._chatMessages.take(index), edited];
+
+    setState(() {
+      _chatMessages
+        ..clear()
+        ..addAll(truncated);
+      _isLoading = true;
+    });
+
+    await _requestAssistantReply();
+  }
+
+  Future<void> _requestAssistantReply() async {
     try {
       final result = await AiService.instance.sendChatMessage(_chatMessages);
 
@@ -389,12 +399,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
       if (!mounted) return;
 
       setState(() {
-        _chatMessages.add(
-          ChatMessage(
-            content: e.message,
-            isUser: false,
-          ),
-        );
+        _chatMessages.add(ChatMessage(content: e.message, isUser: false));
         _isLoading = false;
       });
     } catch (e) {
@@ -409,12 +414,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
       }
 
       setState(() {
-        _chatMessages.add(
-          ChatMessage(
-            content: errorMessage,
-            isUser: false,
-          ),
-        );
+        _chatMessages.add(ChatMessage(content: errorMessage, isUser: false));
         _isLoading = false;
       });
     }

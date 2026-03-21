@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:arya_app/src/core/window_helpers.dart';
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
+import 'package:arya_app/src/features/assistant/services/attachment_policy.dart';
 import 'package:arya_app/src/features/assistant/services/action_executor_service.dart';
 import 'package:arya_app/src/features/assistant/services/screenshot_service.dart';
 import 'package:arya_app/src/features/assistant/services/step_planner.dart';
@@ -32,13 +34,16 @@ class _TakeActionViewState extends State<TakeActionView> {
   final List<ChatAttachment> _pendingAttachments = [];
   final List<_ActionStep> _steps = [];
   final List<String> _logs = [];
+  final List<PlannerTrace> _plannerTraces = [];
   String? _latestScreenshotPath;
   List<UIElement> _latestUIElements = [];
   int? _targetAppPid;
+  late final StepPlanner _planner;
 
   @override
   void initState() {
     super.initState();
+    _planner = StepPlanner(traceLogger: _recordPlannerTrace);
     UIParserService.instance.warmUp();
     ActionExecutorService.instance.warmUp();
   }
@@ -69,6 +74,7 @@ class _TakeActionViewState extends State<TakeActionView> {
       _isPlanning = false;
       _steps.clear();
       _logs.clear();
+      _plannerTraces.clear();
       _capturedScreenshots.clear();
       _abortReason = null;
       _pendingAttachments.clear();
@@ -78,16 +84,10 @@ class _TakeActionViewState extends State<TakeActionView> {
     });
     _controller.clear();
 
-    await _runPlanBasedLoop(
-      task: text,
-      model: model,
-      attachments: attachments,
-    );
+    await _runPlanBasedLoop(task: text, model: model, attachments: attachments);
 
     if (mounted) setState(() => _isLoading = false);
   }
-
-  final StepPlanner _planner = StepPlanner();
 
   // =========================================================================
   // Plan-based execution loop
@@ -118,7 +118,8 @@ class _TakeActionViewState extends State<TakeActionView> {
     final regionTop = (screenContext['top'] as num?)?.toInt() ?? 0;
     final regionWidth = (screenContext['width'] as num?)?.toInt() ?? 1800;
     final regionHeight = (screenContext['height'] as num?)?.toInt() ?? 1066;
-    final scaleFactor = (screenContext['scaleFactor'] as num?)?.toDouble() ?? 1.0;
+    final scaleFactor =
+        (screenContext['scaleFactor'] as num?)?.toDouble() ?? 1.0;
 
     final captureRegion = CaptureRegion(
       x: regionLeft,
@@ -127,8 +128,10 @@ class _TakeActionViewState extends State<TakeActionView> {
       height: regionHeight,
     );
 
-    _log('Screen region: ($regionLeft,$regionTop) '
-        '${regionWidth}x$regionHeight scale=$scaleFactor');
+    _log(
+      'Screen region: ($regionLeft,$regionTop) '
+      '${regionWidth}x$regionHeight scale=$scaleFactor',
+    );
 
     final attachmentMaps = attachments.map(_toAttachmentMap).toList();
     final history = <Map<String, String>>[];
@@ -136,6 +139,10 @@ class _TakeActionViewState extends State<TakeActionView> {
     // --- Phase 1: Initial capture (UI elements only) + full plan ---
     if (mounted) setState(() => _isPlanning = true);
     await _captureContext('Initial context', region: captureRegion);
+    final plannerScreenContext = {
+      ...screenContext,
+      ...await _buildTargetAppContext(),
+    };
 
     _log('Generating plan…');
     List<PlannedStep> plan;
@@ -144,7 +151,7 @@ class _TakeActionViewState extends State<TakeActionView> {
         openRouterKey: openRouterKey,
         model: model,
         task: task,
-        screenContext: screenContext,
+        screenContext: plannerScreenContext,
         uiContext: formatUIElementsForPrompt(_latestUIElements),
         screenshotPath: _latestScreenshotPath,
         tavilyKey: tavilyKey,
@@ -196,8 +203,9 @@ class _TakeActionViewState extends State<TakeActionView> {
         }
         final adjustedStep = resolvedStep;
 
-        final result =
-            await ActionExecutorService.instance.executeStep(adjustedStep);
+        final result = await ActionExecutorService.instance.executeStep(
+          adjustedStep,
+        );
 
         if (!result.ok) {
           _updateStep(step.id, 'failed', result.detail);
@@ -291,10 +299,11 @@ class _TakeActionViewState extends State<TakeActionView> {
         task: task,
         model: model,
         openRouterKey: openRouterKey,
-        screenContext: screenContext,
+        screenContext: plannerScreenContext,
         history: history,
-        failedStep: lastExecutedStep!,
-        failureDetail: 'All planned steps were executed. '
+        failedStep: lastExecutedStep,
+        failureDetail:
+            'All planned steps were executed. '
             'Verify whether the original task "$task" was fully '
             'accomplished by examining the current UI state. '
             'Return an empty array [] if complete, '
@@ -331,15 +340,22 @@ class _TakeActionViewState extends State<TakeActionView> {
     required CaptureRegion captureRegion,
   }) async {
     _log('Re-planning (capturing fresh context + screenshot)…');
-    await _captureContext('Re-plan context',
-        captureScreenshot: true, region: captureRegion);
+    await _captureContext(
+      'Re-plan context',
+      captureScreenshot: true,
+      region: captureRegion,
+    );
+    final plannerScreenContext = {
+      ...screenContext,
+      ...await _buildTargetAppContext(),
+    };
 
     try {
       final newPlan = await _planner.replanFromFailure(
         openRouterKey: openRouterKey,
         model: model,
         task: task,
-        screenContext: screenContext,
+        screenContext: plannerScreenContext,
         uiContext: formatUIElementsForPrompt(_latestUIElements),
         history: history,
         failedStep: failedStep,
@@ -400,8 +416,9 @@ class _TakeActionViewState extends State<TakeActionView> {
       await Future.delayed(Duration(milliseconds: delayMs));
 
       final resolved = _resolveClickTarget(current, _latestUIElements);
-      final chainResult =
-          await ActionExecutorService.instance.executeStep(resolved);
+      final chainResult = await ActionExecutorService.instance.executeStep(
+        resolved,
+      );
 
       history.add({
         'step_id': chainTitle,
@@ -409,8 +426,10 @@ class _TakeActionViewState extends State<TakeActionView> {
         'status': chainResult.ok ? 'completed' : 'failed',
         'detail': chainResult.detail,
       });
-      _log('Chain [$chainIndex] ${chainResult.ok ? "OK" : "FAIL"}: '
-          '${chainResult.detail}');
+      _log(
+        'Chain [$chainIndex] ${chainResult.ok ? "OK" : "FAIL"}: '
+        '${chainResult.detail}',
+      );
 
       if (!chainResult.ok) break;
       prevAction = chainAction;
@@ -447,8 +466,10 @@ class _TakeActionViewState extends State<TakeActionView> {
         el = match.first;
         debugPrint('[TakeAction] Resolved by id [$id] "${el.label}"');
       } else {
-        debugPrint('[TakeAction] ⚠ Element [$id] not found — '
-            '${elements.length} elements available');
+        debugPrint(
+          '[TakeAction] ⚠ Element [$id] not found — '
+          '${elements.length} elements available',
+        );
       }
     }
 
@@ -477,7 +498,9 @@ class _TakeActionViewState extends State<TakeActionView> {
           final desc = e.description.toLowerCase();
 
           int score;
-          if (label == matchLabel || value == matchLabel || desc == matchLabel) {
+          if (label == matchLabel ||
+              value == matchLabel ||
+              desc == matchLabel) {
             score = 100;
           } else if (label.startsWith(matchLabel) ||
               value.startsWith(matchLabel)) {
@@ -490,8 +513,10 @@ class _TakeActionViewState extends State<TakeActionView> {
             continue;
           }
 
-          debugPrint('[TakeAction] Match candidate: [${e.id}] '
-              '"${e.label}" role=${e.role} score=$score');
+          debugPrint(
+            '[TakeAction] Match candidate: [${e.id}] '
+            '"${e.label}" role=${e.role} score=$score',
+          );
 
           if (score > bestScore) {
             bestScore = score;
@@ -501,11 +526,15 @@ class _TakeActionViewState extends State<TakeActionView> {
 
         el = bestMatch;
         if (el != null) {
-          debugPrint('[TakeAction] Best match: [${el.id}] "${el.label}" '
-              'role=${el.role} score=$bestScore');
+          debugPrint(
+            '[TakeAction] Best match: [${el.id}] "${el.label}" '
+            'role=${el.role} score=$bestScore',
+          );
         } else {
-          debugPrint('[TakeAction] ⚠ No element matched '
-              'role=$matchRole label=$matchLabel');
+          debugPrint(
+            '[TakeAction] ⚠ No element matched '
+            'role=$matchRole label=$matchLabel',
+          );
         }
       }
     }
@@ -513,8 +542,7 @@ class _TakeActionViewState extends State<TakeActionView> {
     // If no element resolved, return step unchanged (raw x/y fallback).
     if (el == null) return step;
 
-    final position =
-        (args['position'] as String? ?? 'center').toLowerCase();
+    final position = (args['position'] as String? ?? 'center').toLowerCase();
 
     const pad = 10;
     int x, y;
@@ -544,8 +572,10 @@ class _TakeActionViewState extends State<TakeActionView> {
         }
     }
 
-    debugPrint('[TakeAction] Click target: [${el.id}] "${el.label}" '
-        'role=${el.role} pos=$position → ($x, $y)');
+    debugPrint(
+      '[TakeAction] Click target: [${el.id}] "${el.label}" '
+      'role=${el.role} pos=$position → ($x, $y)',
+    );
 
     final resolvedArgs = Map<String, dynamic>.from(args)
       ..remove('element_id')
@@ -557,34 +587,6 @@ class _TakeActionViewState extends State<TakeActionView> {
       ..['_resolved_element'] = '[${el.id}] ${el.role}: "${el.label}"';
 
     return Map<String, dynamic>.from(step)..['args'] = resolvedArgs;
-  }
-
-  /// Converts region-relative coordinates to absolute screen coordinates.
-  Map<String, dynamic> _offsetCoordinates(
-    Map<String, dynamic> step,
-    int offsetX,
-    int offsetY,
-  ) {
-    if (offsetX == 0 && offsetY == 0) return step;
-
-    final args = step['args'];
-    if (args is! Map<String, dynamic>) return step;
-
-    final action = (step['action'] as String? ?? '').toLowerCase();
-    if (!{'click', 'move_mouse'}.contains(action)) return step;
-
-    final adjustedArgs = Map<String, dynamic>.from(args);
-    if (adjustedArgs.containsKey('x')) {
-      adjustedArgs['x'] = (adjustedArgs['x'] as num).toInt() + offsetX;
-    }
-    if (adjustedArgs.containsKey('y')) {
-      adjustedArgs['y'] = (adjustedArgs['y'] as num).toInt() + offsetY;
-    }
-
-    debugPrint('[TakeAction] Offset coordinates: '
-        '(${args['x']},${args['y']}) → (${adjustedArgs['x']},${adjustedArgs['y']})');
-
-    return Map<String, dynamic>.from(step)..['args'] = adjustedArgs;
   }
 
   /// Resolves the target app PID, parses its accessibility tree, and
@@ -601,8 +603,9 @@ class _TakeActionViewState extends State<TakeActionView> {
     CaptureRegion? region,
   }) async {
     final isFirstCapture = _targetAppPid == null;
-    _targetAppPid ??=
-        await UIParserService.instance.getFrontmostPid(region: region);
+    _targetAppPid ??= await UIParserService.instance.getFrontmostPid(
+      region: region,
+    );
     ActionExecutorService.instance.targetAppPid = _targetAppPid;
 
     if (isFirstCapture && _targetAppPid != null) {
@@ -638,7 +641,11 @@ class _TakeActionViewState extends State<TakeActionView> {
     setState(() {
       if (captureScreenshot && path != null && path.isNotEmpty) {
         _capturedScreenshots.add(
-          _CapturedScreenshot(path: path, label: label, createdAt: DateTime.now()),
+          _CapturedScreenshot(
+            path: path,
+            label: label,
+            createdAt: DateTime.now(),
+          ),
         );
         _logs.add('$label (screenshot + ${elements.length} UI elements)');
       } else {
@@ -684,6 +691,61 @@ class _TakeActionViewState extends State<TakeActionView> {
     });
   }
 
+  void _recordPlannerTrace(PlannerTrace trace) {
+    if (!mounted) return;
+    setState(() => _plannerTraces.add(trace));
+  }
+
+  Future<Map<String, dynamic>> _buildTargetAppContext() async {
+    final pid = _targetAppPid;
+    final windowTitle = _extractPrimaryWindowTitle(_latestUIElements);
+    if (pid == null) {
+      return {
+        if (windowTitle != null) 'target_window_title': windowTitle,
+      };
+    }
+
+    final exePath = await _resolveExecutablePath(pid);
+    final exeName = _executableNameFromPath(exePath);
+    final appName = exeName.replaceAll('.app', '');
+
+    return {
+      'target_pid': pid,
+      if (appName.isNotEmpty) 'target_app_name': appName,
+      if (exePath.isNotEmpty) 'target_executable_path': exePath,
+      if (windowTitle != null) 'target_window_title': windowTitle,
+    };
+  }
+
+  String? _extractPrimaryWindowTitle(List<UIElement> elements) {
+    for (final el in elements) {
+      if ((el.role == 'Window' || el.role == 'Dialog' || el.role == 'Sheet') &&
+          el.title.trim().isNotEmpty) {
+        return el.title.trim();
+      }
+    }
+    return null;
+  }
+
+  Future<String> _resolveExecutablePath(int pid) async {
+    try {
+      final result = await Process.run('ps', ['-p', '$pid', '-o', 'comm=']);
+      if (result.exitCode != 0) return '';
+      return (result.stdout as String).trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  String _executableNameFromPath(String path) {
+    if (path.isEmpty) return '';
+    final pieces = path.split('/');
+    if (pieces.isEmpty) return path;
+    final raw = pieces.last.trim();
+    if (raw.isEmpty) return path;
+    return raw;
+  }
+
   Map<String, dynamic> _toAttachmentMap(ChatAttachment a) {
     String summary;
     if (a.isImage) {
@@ -704,13 +766,15 @@ class _TakeActionViewState extends State<TakeActionView> {
   Future<void> _pickFileFromComputer() async {
     const typeGroup = XTypeGroup(
       label: 'Supported files',
-      extensions: ['pdf', 'txt', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'],
+      extensions: [...supportedAttachmentExtensions],
     );
     final file = await openFile(acceptedTypeGroups: [typeGroup]);
     if (file == null) return;
     final bytes = await file.readAsBytes();
-    final ext = file.name.split('.').last.toLowerCase();
-    final isImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].contains(ext);
+    if (!isSupportedAttachmentFile(file.name) || bytes.isEmpty) {
+      return;
+    }
+    final isImage = isImageAttachmentFile(file.name);
     setState(() {
       _pendingAttachments.add(
         ChatAttachment(name: file.name, bytes: bytes, isImage: isImage),
@@ -789,8 +853,7 @@ class _TakeActionViewState extends State<TakeActionView> {
       );
     }
 
-    final isComplete =
-        !_isLoading && _steps.isNotEmpty && _abortReason == null;
+    final isComplete = !_isLoading && _steps.isNotEmpty && _abortReason == null;
 
     return SelectionArea(
       child: ListView(
@@ -827,9 +890,12 @@ class _TakeActionViewState extends State<TakeActionView> {
               text: _abortReason!,
             ),
           ],
-          if (_logs.isNotEmpty) ...[
+          if (_logs.isNotEmpty || _plannerTraces.isNotEmpty) ...[
             const SizedBox(height: 14),
-            _CollapsibleLogSection(logs: _logs),
+            _CollapsibleLogSection(
+              logs: _logs,
+              plannerTraces: _plannerTraces,
+            ),
           ],
         ],
       ),
@@ -860,20 +926,31 @@ class _TakeActionViewState extends State<TakeActionView> {
                     child: InkWell(
                       onTap: _pickFileFromComputer,
                       borderRadius: BorderRadius.circular(8),
-                      child: const Icon(Icons.add, color: Color(0xFFD2D8DF), size: 20),
+                      child: const Icon(
+                        Icons.add,
+                        color: Color(0xFFD2D8DF),
+                        size: 20,
+                      ),
                     ),
                   ),
                   Expanded(
                     child: TextField(
                       controller: _controller,
-                      style: const TextStyle(color: Color(0xFFE8E9EB), fontSize: 14),
+                      style: const TextStyle(
+                        color: Color(0xFFE8E9EB),
+                        fontSize: 14,
+                      ),
                       maxLines: 5,
                       minLines: 1,
                       textInputAction: TextInputAction.send,
-                      onSubmitted: (_) => _isLoading ? null : unawaited(_submit()),
+                      onSubmitted: (_) =>
+                          _isLoading ? null : unawaited(_submit()),
                       decoration: const InputDecoration(
                         hintText: 'Describe the action you want me to take...',
-                        hintStyle: TextStyle(color: Color(0xFF9EA5AF), fontSize: 14),
+                        hintStyle: TextStyle(
+                          color: Color(0xFF9EA5AF),
+                          fontSize: 14,
+                        ),
                         border: InputBorder.none,
                         contentPadding: EdgeInsets.symmetric(
                           horizontal: 12,
@@ -892,7 +969,9 @@ class _TakeActionViewState extends State<TakeActionView> {
             width: 36,
             height: 36,
             decoration: BoxDecoration(
-              color: _isLoading ? const Color(0xFF677281) : const Color(0xFF1F80E9),
+              color: _isLoading
+                  ? const Color(0xFF677281)
+                  : const Color(0xFF1F80E9),
               borderRadius: BorderRadius.circular(12),
             ),
             child: InkWell(
@@ -920,7 +999,6 @@ class _TakeActionViewState extends State<TakeActionView> {
       ),
     );
   }
-
 }
 
 class _ActionStep {
@@ -1135,21 +1213,14 @@ class _StatusDot extends StatelessWidget {
           ),
         );
       case 'failed':
-        return const Icon(
-          Icons.cancel,
-          size: 16,
-          color: Color(0xFFE57373),
-        );
+        return const Icon(Icons.cancel, size: 16, color: Color(0xFFE57373));
       default:
         return Container(
           width: 16,
           height: 16,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
-            border: Border.all(
-              color: const Color(0xFF4E5661),
-              width: 1.5,
-            ),
+            border: Border.all(color: const Color(0xFF4E5661), width: 1.5),
           ),
         );
     }
@@ -1196,8 +1267,12 @@ class _ResultBanner extends StatelessWidget {
 }
 
 class _CollapsibleLogSection extends StatefulWidget {
-  const _CollapsibleLogSection({required this.logs});
+  const _CollapsibleLogSection({
+    required this.logs,
+    required this.plannerTraces,
+  });
   final List<String> logs;
+  final List<PlannerTrace> plannerTraces;
 
   @override
   State<_CollapsibleLogSection> createState() => _CollapsibleLogSectionState();
@@ -1205,6 +1280,8 @@ class _CollapsibleLogSection extends StatefulWidget {
 
 class _CollapsibleLogSectionState extends State<_CollapsibleLogSection> {
   bool _isExpanded = false;
+  bool _plannerExpanded = false;
+  final Set<int> _expandedTraceIndexes = <int>{};
 
   @override
   Widget build(BuildContext context) {
@@ -1261,10 +1338,180 @@ class _CollapsibleLogSectionState extends State<_CollapsibleLogSection> {
                       ),
                     ),
                   ),
+                if (widget.plannerTraces.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  InkWell(
+                    onTap: () {
+                      setState(() => _plannerExpanded = !_plannerExpanded);
+                    },
+                    borderRadius: BorderRadius.circular(6),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        children: [
+                          Icon(
+                            _plannerExpanded
+                                ? Icons.expand_more
+                                : Icons.chevron_right,
+                            size: 15,
+                            color: const Color(0xFF8A95A5),
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'LLM prompts & responses (${widget.plannerTraces.length})',
+                            style: const TextStyle(
+                              color: Color(0xFF8A95A5),
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  if (_plannerExpanded) ...[
+                    const SizedBox(height: 4),
+                    for (var i = 0; i < widget.plannerTraces.length; i++)
+                      _PlannerTraceTile(
+                        index: i,
+                        trace: widget.plannerTraces[i],
+                        expanded: _expandedTraceIndexes.contains(i),
+                        onToggle: () {
+                          setState(() {
+                            if (_expandedTraceIndexes.contains(i)) {
+                              _expandedTraceIndexes.remove(i);
+                            } else {
+                              _expandedTraceIndexes.add(i);
+                            }
+                          });
+                        },
+                      ),
+                  ],
+                ],
               ],
             ),
           ),
         ],
+      ],
+    );
+  }
+}
+
+class _PlannerTraceTile extends StatelessWidget {
+  const _PlannerTraceTile({
+    required this.index,
+    required this.trace,
+    required this.expanded,
+    required this.onToggle,
+  });
+
+  final int index;
+  final PlannerTrace trace;
+  final bool expanded;
+  final VoidCallback onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final title =
+        '#${index + 1} ${trace.label} • ${trace.model}${trace.hasScreenshot ? ' • screenshot' : ''}';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF242A32),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: onToggle,
+            borderRadius: BorderRadius.circular(6),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              child: Row(
+                children: [
+                  Icon(
+                    expanded ? Icons.expand_more : Icons.chevron_right,
+                    size: 14,
+                    color: const Color(0xFF9EA5AF),
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: const TextStyle(
+                        color: Color(0xFFB8C1CC),
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (expanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _TraceSection(label: 'System prompt', content: trace.systemPrompt),
+                  const SizedBox(height: 6),
+                  _TraceSection(label: 'User prompt', content: trace.userPrompt),
+                  const SizedBox(height: 6),
+                  _TraceSection(
+                    label: 'Request payload (sanitized)',
+                    content: trace.requestPayload,
+                  ),
+                  const SizedBox(height: 6),
+                  _TraceSection(label: 'Raw response', content: trace.rawResponse),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TraceSection extends StatelessWidget {
+  const _TraceSection({required this.label, required this.content});
+
+  final String label;
+  final String content;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            color: Color(0xFF8A95A5),
+            fontSize: 10.5,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 3),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1D222A),
+            borderRadius: BorderRadius.circular(5),
+          ),
+          child: Text(
+            content.isEmpty ? '[empty]' : content,
+            style: const TextStyle(
+              color: Color(0xFF9EA5AF),
+              fontSize: 10.5,
+              fontFamily: 'monospace',
+              height: 1.35,
+            ),
+          ),
+        ),
       ],
     );
   }

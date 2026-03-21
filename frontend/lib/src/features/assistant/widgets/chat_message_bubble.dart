@@ -6,10 +6,7 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 
 /// A user message bubble (left-aligned, blue background).
 class UserMessageBubble extends StatelessWidget {
-  const UserMessageBubble({
-    required this.message,
-    super.key,
-  });
+  const UserMessageBubble({required this.message, super.key});
 
   final ChatMessage message;
 
@@ -31,16 +28,12 @@ class UserMessageBubble extends StatelessWidget {
           children: [
             if (message.attachments.isNotEmpty) ...[
               MessageAttachmentDisplay(attachments: message.attachments),
-              if (message.content.isNotEmpty)
-                const SizedBox(height: 6),
+              if (message.content.isNotEmpty) const SizedBox(height: 6),
             ],
             if (message.content.isNotEmpty)
               Text(
                 message.content,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                ),
+                style: const TextStyle(color: Colors.white, fontSize: 14),
               ),
           ],
         ),
@@ -52,10 +45,7 @@ class UserMessageBubble extends StatelessWidget {
 /// An assistant message bubble (right-aligned, gray background).
 /// Includes copy button and latency display below the bubble.
 class AssistantMessageBubble extends StatelessWidget {
-  const AssistantMessageBubble({
-    required this.message,
-    super.key,
-  });
+  const AssistantMessageBubble({required this.message, super.key});
 
   final ChatMessage message;
 
@@ -80,10 +70,7 @@ class AssistantMessageBubble extends StatelessWidget {
               child: MarkdownBody(
                 data: message.content,
                 styleSheet: MarkdownStyleSheet(
-                  p: const TextStyle(
-                    color: Color(0xFFE8E9EB),
-                    fontSize: 14,
-                  ),
+                  p: const TextStyle(color: Color(0xFFE8E9EB), fontSize: 14),
                   h1: const TextStyle(
                     color: Color(0xFFE8E9EB),
                     fontSize: 20,
@@ -118,10 +105,7 @@ class AssistantMessageBubble extends StatelessWidget {
                   ),
                   blockquoteDecoration: const BoxDecoration(
                     border: Border(
-                      left: BorderSide(
-                        color: Color(0xFF1F80E9),
-                        width: 3,
-                      ),
+                      left: BorderSide(color: Color(0xFF1F80E9), width: 3),
                     ),
                   ),
                   listBullet: const TextStyle(
@@ -141,13 +125,9 @@ class AssistantMessageBubble extends StatelessWidget {
                     message.latencyMs! >= 1000
                         ? '${(message.latencyMs! / 1000).toStringAsFixed(1)}s'
                         : '${message.latencyMs}ms',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 11,
-                    ),
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
                   ),
-                if (message.latencyMs != null)
-                  const SizedBox(width: 12),
+                if (message.latencyMs != null) const SizedBox(width: 12),
                 CopyButton(
                   textToCopy: message.content,
                   iconColor: Colors.white,

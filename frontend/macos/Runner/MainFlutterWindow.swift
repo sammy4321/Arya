@@ -1,6 +1,5 @@
 import Cocoa
 import FlutterMacOS
-import desktop_multi_window
 import file_selector_macos
 
 class MainFlutterWindow: NSPanel {
@@ -41,21 +40,6 @@ class MainFlutterWindow: NSPanel {
     self.setFrame(windowFrame, display: true)
 
     RegisterGeneratedPlugins(registry: flutterViewController)
-    FlutterMultiWindowPlugin.setOnWindowCreatedCallback { controller in
-      FileSelectorPlugin.register(with: controller.registrar(forPlugin: "FileSelectorPlugin"))
-      guard let subWindow = controller.view.window else { return }
-      subWindow.level = .normal
-      subWindow.hidesOnDeactivate = false
-      subWindow.hasShadow = false
-      subWindow.titleVisibility = .hidden
-      subWindow.titlebarAppearsTransparent = true
-      subWindow.styleMask.remove(.miniaturizable)
-      subWindow.styleMask.remove(.resizable)
-      subWindow.styleMask.remove(.closable)
-      subWindow.standardWindowButton(.closeButton)?.isHidden = true
-      subWindow.standardWindowButton(.miniaturizeButton)?.isHidden = true
-      subWindow.standardWindowButton(.zoomButton)?.isHidden = true
-    }
 
     super.awakeFromNib()
   }
