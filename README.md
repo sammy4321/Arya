@@ -59,7 +59,7 @@ There is **no bundled backend server**—the app talks to providers you configur
 
 - **Client:** Flutter **desktop** app (`frontend/`).
 - **AI:** OpenRouter for chat/completions; Tavily optional for web search context.
-- **Persistence:** `sqflite_common_ffi` for settings, file vault, and strategy cache—stored under the OS application data path (e.g. `~/Library/Application Support/Arya` on macOS).
+- **Persistence:** `sqflite_common_ffi` with a single local SQLite database (`arya.db`) for app data such as settings and file vault metadata—stored under the OS application data path (e.g. `~/Library/Application Support/Arya/arya.db` on macOS).
 - **Native:** Platform code where required (e.g. clipboard, windowing, accessibility) under `frontend/macos/` (and other desktop embedders as enabled).
 
 ---
@@ -119,7 +119,7 @@ Open **Settings** inside the app and set:
 | **Model** | Chosen from OpenRouter’s catalog |
 | **Tavily API key** | Optional; improves answers when web search is used |
 
-Keys and preferences are stored **locally** in SQLite—no project-hosted backend is involved.
+Keys and preferences are stored **locally** in SQLite—no project-hosted backend is involved. On macOS the default database path is `~/Library/Application Support/Arya/arya.db`.
 
 ---
 

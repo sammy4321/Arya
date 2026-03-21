@@ -2,147 +2,89 @@ import 'dart:convert';
 
 import 'package:arya_app/src/features/assistant/services/ai_validation.dart';
 import 'package:arya_app/src/features/assistant/services/openrouter_client.dart';
-import 'package:arya_app/src/features/assistant/services/strategy_cache.dart';
 import 'package:flutter/foundation.dart';
 
-/// Result of the strategy LLM call — a normalized task pattern plus ranked
-/// approaches that can be cached and reused across similar tasks.
-class StrategyResult {
-  const StrategyResult({
+class MilestoneApproach {
+  const MilestoneApproach({
+    required this.title,
+    required this.confidence,
+    required this.milestoneStrategies,
+  });
+
+  final String title;
+  final double confidence;
+  final List<String> milestoneStrategies;
+
+  String strategyForMilestone(int milestoneIndex, String milestoneLabel) {
+    if (milestoneIndex >= 0 && milestoneIndex < milestoneStrategies.length) {
+      final strategy = milestoneStrategies[milestoneIndex].trim();
+      if (strategy.isNotEmpty) return strategy;
+    }
+    return milestoneLabel;
+  }
+}
+
+class TaskDecomposition {
+  const TaskDecomposition({
     required this.taskPattern,
+    required this.milestones,
     required this.approaches,
     required this.source,
   });
 
   final String taskPattern;
-  final List<StrategyApproach> approaches;
-
-  /// "cache" when served from SQLite, "llm" when freshly generated.
+  final List<String> milestones;
+  final List<MilestoneApproach> approaches;
   final String source;
-
-  /// Convenience — the best approach text, or empty if none.
-  String get bestApproachText =>
-      approaches.isNotEmpty ? approaches.first.approach : '';
 }
 
-/// Orchestrates the two-tier strategy flow:
-///
-/// 1. Check `StrategyCache` for a matching (app, task_pattern).
-/// 2. If miss → call LLM to produce a normalised `task_pattern` and ranked
-///    approaches → store in cache.
-/// 3. Return the best approach so the execution planner can incorporate it.
-///
-/// Also exposes `recordSuccess` / `recordFailure` for feedback.
 class TaskStrategyPlanner {
   TaskStrategyPlanner({OpenRouterClient? openRouterClient})
       : _openRouter = openRouterClient ?? OpenRouterClient();
 
   final OpenRouterClient _openRouter;
-  final StrategyCache _cache = StrategyCache.instance;
 
-  /// Resolve a strategy for [task] running in [appName].
-  ///
-  /// Fast-path: if [_isTrivialTask] returns true, skips both cache and LLM.
-  Future<StrategyResult?> resolve({
+  Future<TaskDecomposition> decompose({
     required String openRouterKey,
     required String model,
     required String task,
     required String appName,
   }) async {
     if (_isTrivialTask(task)) {
-      debugPrint('[Strategy] Trivial task — skipping cache+LLM');
-      return null;
+      debugPrint('[Preplanner] Trivial task — using heuristic decomposition');
+      return _fallbackDecomposition(task, source: 'heuristic');
     }
 
-    // Phase 1 — cache probe.
-    // We need the normalised pattern. Try a quick LLM-free keyword match
-    // against existing cache entries for this app.
-    final candidatePattern = _roughPattern(task);
-    final cached = await _cache.lookup(
-      appName: appName,
-      taskPattern: candidatePattern,
-    );
-
-    if (cached != null) {
-      final best = cached.bestApproach;
-      if (best != null) {
-        debugPrint(
-          '[Strategy] Cache HIT for "$appName / $candidatePattern" '
-          '(uses=${cached.useCount}, fails=${cached.failCount})',
-        );
-        await _cache.recordSuccess(
-          appName: appName,
-          taskPattern: cached.taskPattern,
-        );
-        return StrategyResult(
-          taskPattern: cached.taskPattern,
-          approaches: cached.approaches,
-          source: 'cache',
-        );
-      }
-    }
-
-    // Phase 2 — strategy LLM call.
-    debugPrint('[Strategy] Cache miss — calling strategy LLM');
     validateOpenRouterConfig(apiKey: openRouterKey, model: model);
 
-    final systemPrompt = _buildSystemPrompt();
-    final userPrompt = _buildUserPrompt(task: task, appName: appName);
-
     final messages = <Map<String, dynamic>>[
-      {'role': 'system', 'content': systemPrompt},
-      {'role': 'user', 'content': userPrompt},
+      {'role': 'system', 'content': _buildSystemPrompt()},
+      {
+        'role': 'user',
+        'content': _buildUserPrompt(task: task, appName: appName),
+      },
     ];
 
-    String raw;
     try {
-      raw = await _openRouter.chatCompletion(
+      final raw = await _openRouter.chatCompletion(
         apiKey: openRouterKey,
         model: model,
         messages: messages,
       );
+      debugPrint(
+        '[Preplanner] LLM raw: ${raw.length > 300 ? '${raw.substring(0, 300)}…' : raw}',
+      );
+      final parsed = _parseResponse(raw);
+      if (parsed != null) {
+        return parsed;
+      }
+      debugPrint('[Preplanner] Parse failed — using fallback decomposition');
     } catch (e) {
-      debugPrint('[Strategy] LLM call failed: $e');
-      return null;
+      debugPrint('[Preplanner] LLM call failed: $e');
     }
 
-    debugPrint('[Strategy] LLM raw: ${raw.length > 300 ? '${raw.substring(0, 300)}…' : raw}');
-
-    final parsed = _parseResponse(raw);
-    if (parsed == null) {
-      debugPrint('[Strategy] Failed to parse strategy JSON');
-      return null;
-    }
-
-    // Store in cache.
-    await _cache.store(
-      appName: appName,
-      taskPattern: parsed.taskPattern,
-      approaches: parsed.approaches,
-    );
-
-    return parsed;
+    return _fallbackDecomposition(task, source: 'fallback');
   }
-
-  /// Record successful task completion.
-  Future<void> recordSuccess({
-    required String appName,
-    required String taskPattern,
-  }) async {
-    await _cache.recordSuccess(appName: appName, taskPattern: taskPattern);
-  }
-
-  /// Record task failure (replan exhaustion).
-  Future<void> recordFailure({
-    required String appName,
-    required String taskPattern,
-  }) async {
-    await _cache.recordFailure(appName: appName, taskPattern: taskPattern);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Trivial task detection — single obvious action, no strategy needed.
-  // ---------------------------------------------------------------------------
 
   static bool _isTrivialTask(String task) {
     final words = task.trim().split(RegExp(r'\s+')).length;
@@ -159,13 +101,6 @@ class TaskStrategyPlanner {
     return trivialPrefixes.any(lower.startsWith);
   }
 
-  // ---------------------------------------------------------------------------
-  // Rough pattern — a cheap, LLM-free normalisation for cache probing.
-  //
-  // Strips articles, lowercases, and trims to max 60 chars. Only used for
-  // cache lookup — the LLM produces the authoritative pattern for storage.
-  // ---------------------------------------------------------------------------
-
   static String _roughPattern(String task) {
     var s = task.toLowerCase().trim();
     const stopwords = ['a ', 'an ', 'the ', 'my ', 'this ', 'that '];
@@ -177,50 +112,80 @@ class TaskStrategyPlanner {
     return s;
   }
 
-  // ---------------------------------------------------------------------------
-  // Prompt construction
-  // ---------------------------------------------------------------------------
+  static TaskDecomposition _fallbackDecomposition(
+    String task, {
+    required String source,
+  }) {
+    final normalized = _roughPattern(task);
+    return TaskDecomposition(
+      taskPattern: normalized.isEmpty ? 'complete task' : normalized,
+      milestones: [task.trim()],
+      approaches: [
+        MilestoneApproach(
+          title: 'Direct completion',
+          confidence: 1.0,
+          milestoneStrategies: [task.trim()],
+        ),
+      ],
+      source: source,
+    );
+  }
 
   static String _buildSystemPrompt() => '''
-You are a task strategy analyst for a desktop automation system. Given a user's task description and the target application, produce:
+You are a task decomposition planner for a desktop automation system.
 
-1. **task_pattern** — a short, canonical phrase (max 8 words, lowercase) that captures the *intent* independent of specific details. Examples:
-   - "send message to contact" (not "send hi to John on WhatsApp")
-   - "create new file in project" (not "create index.html in my React app")
-   - "commit changes with message"
+Given a user task and target application, produce:
 
-2. **approaches** — a ranked list (1-4) of high-level strategies to accomplish the task, each with a confidence score (0.0–1.0). Approaches describe *how* to achieve the goal via GUI interaction patterns, NOT concrete click sequences.
+1. task_pattern:
+- a short canonical phrase (max 8 words, lowercase)
+- generalize away names, exact message text, filenames, and other specific payloads
+
+2. milestones:
+- 1 to 6 minimal milestone goals
+- each milestone should describe a meaningful checkpoint, not a click sequence
+- milestones should be ordered and as basic as possible
+
+3. approaches:
+- 1 to 3 realistic ways to complete the task
+- each approach must include one strategy sentence per milestone
+- strategy sentences describe how that approach would achieve that milestone
+- no UI element ids, no coordinates, no code, no terminal instructions
 
 ## Response format — return ONLY valid JSON:
 {
-  "task_pattern": "short canonical intent",
+  "task_pattern": "send message to contact",
+  "milestones": [
+    "Open the target conversation",
+    "Focus the message input",
+    "Send the message"
+  ],
   "approaches": [
-    {"approach": "Description of strategy 1", "confidence": 0.9},
-    {"approach": "Description of strategy 2", "confidence": 0.6}
+    {
+      "title": "Use visible conversation list",
+      "confidence": 0.88,
+      "milestone_strategies": [
+        "Find and open the conversation directly from the visible list",
+        "Click the composer area in the open conversation",
+        "Type and send the message using the standard send flow"
+      ]
+    }
   ]
 }
 
-## Rules:
-- task_pattern must generalise across similar tasks (strip names, filenames, specific text).
-- Approaches should describe GUI navigation paths, not code or API calls.
-- Rank by reliability: prefer approaches that use clearly labeled buttons/menus over shortcuts.
-- Confidence reflects how likely the approach succeeds in a typical desktop automation context.
-- Return ONLY the JSON object, no markdown fences, no explanation.''';
+## Rules
+- milestone_strategies length MUST equal milestones length
+- milestones must be outcome-oriented, not implementation-heavy
+- approaches should be diverse but realistic
+- prefer GUI-first, reliable flows over shortcuts
+- return ONLY JSON, no markdown fences, no explanation''';
 
   static String _buildUserPrompt({
     required String task,
     required String appName,
-  }) =>
-      'Target app: $appName\nTask: $task';
+  }) => 'Target app: ${appName.isEmpty ? 'unknown' : appName}\nTask: $task';
 
-  // ---------------------------------------------------------------------------
-  // Response parsing
-  // ---------------------------------------------------------------------------
-
-  static StrategyResult? _parseResponse(String raw) {
+  static TaskDecomposition? _parseResponse(String raw) {
     raw = raw.trim();
-
-    // Strip markdown fences if present.
     if (raw.startsWith('```')) {
       final firstNewline = raw.indexOf('\n');
       if (firstNewline > 0) raw = raw.substring(firstNewline + 1);
@@ -233,7 +198,6 @@ You are a task strategy analyst for a desktop automation system. Given a user's 
       final decoded = jsonDecode(raw);
       if (decoded is Map<String, dynamic>) json = decoded;
     } catch (_) {
-      // Try to extract the first { ... } block.
       final start = raw.indexOf('{');
       final end = raw.lastIndexOf('}');
       if (start >= 0 && end > start) {
@@ -243,29 +207,47 @@ You are a task strategy analyst for a desktop automation system. Given a user's 
         } catch (_) {}
       }
     }
-
     if (json == null) return null;
 
     final taskPattern =
         (json['task_pattern'] as String?)?.trim().toLowerCase() ?? '';
-    if (taskPattern.isEmpty) return null;
-
-    final approachesRaw = json['approaches'];
-    if (approachesRaw is! List || approachesRaw.isEmpty) return null;
-
-    final approaches = approachesRaw
-        .whereType<Map<String, dynamic>>()
-        .map(StrategyApproach.fromJson)
-        .where((a) => a.approach.trim().isNotEmpty)
+    final milestones = (json['milestones'] as List? ?? const [])
+        .map((item) => item.toString().trim())
+        .where((item) => item.isNotEmpty)
         .toList();
+    final approachesRaw = json['approaches'];
+    if (taskPattern.isEmpty || milestones.isEmpty || approachesRaw is! List) {
+      return null;
+    }
 
+    final approaches = <MilestoneApproach>[];
+    for (final item in approachesRaw.whereType<Map<String, dynamic>>()) {
+      final title = (item['title'] as String?)?.trim() ?? '';
+      final confidence = (item['confidence'] as num?)?.toDouble() ?? 0.5;
+      final strategyList = (item['milestone_strategies'] as List? ?? const [])
+          .map((strategy) => strategy.toString().trim())
+          .toList();
+      if (title.isEmpty) continue;
+      final normalizedStrategies = <String>[
+        for (var i = 0; i < milestones.length; i++)
+          i < strategyList.length && strategyList[i].isNotEmpty
+              ? strategyList[i]
+              : milestones[i],
+      ];
+      approaches.add(
+        MilestoneApproach(
+          title: title,
+          confidence: confidence,
+          milestoneStrategies: normalizedStrategies,
+        ),
+      );
+    }
     if (approaches.isEmpty) return null;
-
-    // Sort by confidence descending.
     approaches.sort((a, b) => b.confidence.compareTo(a.confidence));
 
-    return StrategyResult(
+    return TaskDecomposition(
       taskPattern: taskPattern,
+      milestones: milestones,
       approaches: approaches,
       source: 'llm',
     );

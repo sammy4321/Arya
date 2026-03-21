@@ -133,6 +133,47 @@ class PlannedStep {
   };
 }
 
+class CompletionContract {
+  const CompletionContract({
+    required this.primary,
+    this.secondary = const [],
+    this.requiresLlmIfUnclear = true,
+    this.recommendScreenshotOnAmbiguity = false,
+  });
+
+  final VerifyCriteria primary;
+  final List<VerifyCriteria> secondary;
+  final bool requiresLlmIfUnclear;
+  final bool recommendScreenshotOnAmbiguity;
+
+  factory CompletionContract.fromJson(Map<String, dynamic> json) {
+    final secondaryRaw = json['secondary'] as List? ?? const [];
+    return CompletionContract(
+      primary: json['primary'] is Map<String, dynamic>
+          ? VerifyCriteria.fromJson(json['primary'] as Map<String, dynamic>)
+          : const VerifyCriteria(type: 'any'),
+      secondary: [
+        for (final item in secondaryRaw.whereType<Map<String, dynamic>>())
+          VerifyCriteria.fromJson(item),
+      ],
+      requiresLlmIfUnclear:
+          json['requires_llm_if_unclear'] as bool? ?? true,
+      recommendScreenshotOnAmbiguity:
+          json['recommend_screenshot_on_ambiguity'] as bool? ?? false,
+    );
+  }
+}
+
+class MilestonePlan {
+  const MilestonePlan({
+    required this.steps,
+    required this.completionContract,
+  });
+
+  final List<PlannedStep> steps;
+  final CompletionContract completionContract;
+}
+
 // ---------------------------------------------------------------------------
 // StepPlanner — generates a full plan upfront, re-plans only on failure.
 // ---------------------------------------------------------------------------
@@ -213,17 +254,22 @@ Use hierarchy to improve disambiguation:
   // generateFullPlan — one LLM call, returns all steps.
   // -----------------------------------------------------------------------
 
-  Future<List<PlannedStep>> generateFullPlan({
+  Future<MilestonePlan> generateFullPlan({
     required String openRouterKey,
     required String model,
     required String task,
+    required List<String> milestones,
+    required int milestoneIndex,
+    required String approachTitle,
+    required String milestoneStrategy,
+    List<String> completedMilestones = const [],
+    List<String> fallbackApproachTitles = const [],
     required Map<String, dynamic> screenContext,
     required String uiContext,
     String? screenshotPath,
     String tavilyKey = '',
     String webMode = 'auto',
     List<Map<String, dynamic>> attachments = const [],
-    String strategyHint = '',
   }) async {
     _validateKeys(openRouterKey, model);
 
@@ -233,6 +279,17 @@ Use hierarchy to improve disambiguation:
       task: task,
     );
     final attachmentSummary = _formatAttachments(attachments);
+    final currentMilestone = milestones[milestoneIndex];
+    final completedMilestonesText = completedMilestones.isEmpty
+        ? '[none]'
+        : completedMilestones.map((m) => '- $m').join('\n');
+    final remainingMilestones = milestones.skip(milestoneIndex + 1).toList();
+    final remainingMilestonesText = remainingMilestones.isEmpty
+        ? '[none]'
+        : remainingMilestones.map((m) => '- $m').join('\n');
+    final fallbackApproachesText = fallbackApproachTitles.isEmpty
+        ? '[none]'
+        : fallbackApproachTitles.map((a) => '- $a').join('\n');
 
     final hasScreenshot = screenshotPath != null;
     final systemPrompt =
@@ -259,43 +316,82 @@ ${_verifyBlock()}
 ${_hierarchyBlock()}
 
 ${_safetyBlock()}
-${strategyHint.isNotEmpty ? '\n## Recommended strategy\nThe following high-level approach has been identified as effective for this type of task. Use it as guidance when constructing your step-by-step plan:\n$strategyHint\n' : ''}
+
+## Milestone planning mode
+- Plan ONLY the steps needed to complete the CURRENT milestone from the CURRENT UI state.
+- Do NOT plan future milestones yet.
+- Use the selected approach below as your primary route for this milestone.
+- You may adapt within the same approach if the UI differs slightly, but do NOT switch to a fallback approach unless explicitly told in a later call.
+- Return [] only if the current milestone is already complete in the current UI state.
+
+## Current milestone
+- Milestone ${milestoneIndex + 1} of ${milestones.length}: $currentMilestone
+- Selected approach: $approachTitle
+- Strategy for this milestone: $milestoneStrategy
+
 ${uiContext.isNotEmpty ? '\n$uiContext\n' : ''}
-## Response format — return ONLY a JSON array:
-[
-  {"id":"step_1","title":"...","action":"click","args":{"element_id":N,...},"then":{...},"verify":{"type":"...","role":"...","label_contains":"..."}},
-  {"id":"step_2","title":"...","action":"click","args":{"match_role":"MenuItem","match_label":"New File"},"verify":{"type":"element_gone","role":"Menu"}},
-  ...
-]
-Return ALL steps needed to complete the task from current state to finish. Be thorough — include closing menus, confirming dialogs, etc.''';
+## Response format — return ONLY valid JSON:
+{
+  "steps": [
+    {"id":"step_1","title":"...","action":"click","args":{"element_id":N,...},"then":{...},"verify":{"type":"...","role":"...","label_contains":"..."}}
+  ],
+  "completion_contract": {
+    "primary": {"type":"text_visible","label_contains":"..."},
+    "secondary": [
+      {"type":"element_visible","role":"TextArea","label_contains":"..."}
+    ],
+    "requires_llm_if_unclear": true,
+    "recommend_screenshot_on_ambiguity": false
+  }
+}
+Return ONLY the steps needed to complete the current milestone plus a completion contract for deterministic milestone verification.''';
 
     final userPrompt =
         '''Task: $task
 
+Completed milestones:
+$completedMilestonesText
+
+Current milestone:
+- $currentMilestone
+
+Remaining milestones after this:
+$remainingMilestonesText
+
+Fallback approaches for this milestone:
+$fallbackApproachesText
+
 Attachments: ${attachmentSummary.isEmpty ? '[none]' : attachmentSummary}
 ${webContext.isNotEmpty ? '\n$webContext' : ''}
 
-Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then produce a COMPLETE plan (JSON array) to accomplish this task.''';
+Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then produce the JSON object containing `steps` and `completion_contract` for ONLY the current milestone.''';
 
-    return _callAndParsePlan(
+    final raw = await _callPlannerRaw(
       openRouterKey: openRouterKey,
       model: model,
       systemPrompt: systemPrompt,
       userPrompt: userPrompt,
       screenshotPath: screenshotPath,
-      label: 'generateFullPlan',
+      label: 'generateMilestonePlan',
       uiContext: uiContext,
     );
+    return _parseMilestonePlan(raw, currentMilestone);
   }
 
   // -----------------------------------------------------------------------
   // replanFromFailure — called when a verification criterion fails.
   // -----------------------------------------------------------------------
 
-  Future<List<PlannedStep>> replanFromFailure({
+  Future<MilestonePlan> replanFromFailure({
     required String openRouterKey,
     required String model,
     required String task,
+    required List<String> milestones,
+    required int milestoneIndex,
+    required String approachTitle,
+    required String milestoneStrategy,
+    List<String> completedMilestones = const [],
+    List<String> fallbackApproachTitles = const [],
     required Map<String, dynamic> screenContext,
     required String uiContext,
     required List<Map<String, String>> history,
@@ -305,6 +401,13 @@ Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then 
     String? screenshotPath,
   }) async {
     _validateKeys(openRouterKey, model);
+    final currentMilestone = milestones[milestoneIndex];
+    final completedMilestonesText = completedMilestones.isEmpty
+        ? '[none]'
+        : completedMilestones.map((m) => '- $m').join('\n');
+    final fallbackApproachesText = fallbackApproachTitles.isEmpty
+        ? '[none]'
+        : fallbackApproachTitles.map((a) => '- $a').join('\n');
 
     final historyLines = history
         .map((h) {
@@ -319,7 +422,7 @@ Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then 
         .join('\n');
 
     final systemPrompt =
-        '''You are a desktop automation agent. A plan failed at one step. Re-plan from the current state. A screenshot is attached so you can see the actual screen alongside the UI element list.
+        '''You are a desktop automation agent. A plan failed at one step while trying to complete the CURRENT milestone. Re-plan from the current state. A screenshot is attached so you can see the actual screen alongside the UI element list.
 
 ## Screen info
 ${jsonEncode(screenContext)}
@@ -339,13 +442,40 @@ ${_hierarchyBlock()}
 
 ${_safetyBlock()}
 
+## Milestone re-planning mode
+- Re-plan ONLY for the current milestone.
+- Stay within the selected approach unless the failure detail explicitly says the milestone attempt is exhausted.
+- Return [] if the current milestone is already complete.
+- Do NOT plan future milestones.
+
 ${uiContext.isNotEmpty ? '\n$uiContext\n' : ''}
-## Response format — return ONLY a JSON array of remaining steps.
-Every step MUST have: "id" (e.g. "step_6"), "title", "action", "args", "verify".
-Return [] (empty array) if the task is already complete.''';
+## Response format — return ONLY valid JSON:
+{
+  "steps": [
+    {"id":"step_6","title":"...","action":"click","args":{"match_role":"Button","match_label":"..."},"verify":{"type":"element_visible","label_contains":"..."}}
+  ],
+  "completion_contract": {
+    "primary": {"type":"text_visible","label_contains":"..."},
+    "secondary": [],
+    "requires_llm_if_unclear": true,
+    "recommend_screenshot_on_ambiguity": true
+  }
+}
+Return `{"steps":[],"completion_contract":{...}}` if the current milestone is already complete.''';
 
     final userPrompt =
         '''Task: $task
+
+Completed milestones:
+$completedMilestonesText
+
+Current milestone:
+- $currentMilestone
+- Selected approach: $approachTitle
+- Strategy for this milestone: $milestoneStrategy
+
+Fallback approaches for this milestone:
+$fallbackApproachesText
 
 ## Steps already completed:
 ${historyLines.isEmpty ? '[none]' : historyLines}
@@ -358,12 +488,12 @@ Failure: $failureDetail
 ## Remaining steps that were planned:
 ${remainingDesc.isEmpty ? '[none]' : remainingDesc}
 
-Look at the current UI elements${screenshotPath != null ? ' and attached screenshot' : ''}. Produce a NEW plan (JSON array) to complete the ORIGINAL task from this point.
+Look at the current UI elements${screenshotPath != null ? ' and attached screenshot' : ''}. Produce a NEW JSON object with `steps` and `completion_contract` to complete the CURRENT milestone from this point.
 - If a type_text action "succeeded" but verification failed, the text was likely typed — move forward rather than retrying.
-- You may retry a failed step differently, skip it, or take a completely different approach.
-- If the task is already fully complete, return [].''';
+- You may retry a failed step differently or skip it, but stay within the selected approach for this milestone.
+- If the current milestone is already fully complete, return [].''';
 
-    return _callAndParsePlan(
+    final raw = await _callPlannerRaw(
       openRouterKey: openRouterKey,
       model: model,
       systemPrompt: systemPrompt,
@@ -372,13 +502,140 @@ Look at the current UI elements${screenshotPath != null ? ' and attached screens
       label: 'replanFromFailure',
       uiContext: uiContext,
     );
+    return _parseMilestonePlan(
+      raw,
+      currentMilestone,
+      recommendScreenshotOnAmbiguity: true,
+    );
+  }
+
+  Future<bool> checkMilestoneCompletion({
+    required String openRouterKey,
+    required String model,
+    required String task,
+    required List<String> milestones,
+    required int milestoneIndex,
+    required String approachTitle,
+    required String milestoneStrategy,
+    List<String> completedMilestones = const [],
+    required Map<String, dynamic> screenContext,
+    required String uiContext,
+    String? screenshotPath,
+  }) async {
+    _validateKeys(openRouterKey, model);
+
+    final currentMilestone = milestones[milestoneIndex];
+    final completedMilestonesText = completedMilestones.isEmpty
+        ? '[none]'
+        : completedMilestones.map((m) => '- $m').join('\n');
+    final systemPrompt =
+        '''You are a desktop automation agent performing a milestone completion check.
+
+Decide whether the CURRENT milestone is already complete based on the current UI state.${screenshotPath != null ? ' A screenshot is also attached for visual reference.' : ''}
+
+## Screen info
+${jsonEncode(screenContext)}
+
+${_hierarchyBlock()}
+
+${_safetyBlock()}
+
+${uiContext.isNotEmpty ? '\n$uiContext\n' : ''}
+## Response format — return ONLY valid JSON:
+{"complete": true}
+or
+{"complete": false}
+
+Return only the JSON object.''';
+
+    final userPrompt =
+        '''Task: $task
+
+Completed milestones:
+$completedMilestonesText
+
+Current milestone:
+- $currentMilestone
+- Selected approach: $approachTitle
+- Strategy for this milestone: $milestoneStrategy
+
+Determine whether the current milestone is already complete from the current UI state.''';
+
+    final userContent = await _buildUserContent(userPrompt, screenshotPath);
+    final requestMessages = <Map<String, dynamic>>[
+      {'role': 'system', 'content': systemPrompt},
+      {'role': 'user', 'content': userContent},
+    ];
+    final requestPayload = <String, dynamic>{
+      'model': model,
+      'messages': requestMessages,
+    };
+    final logPayload = _sanitizePayloadForLog(requestPayload);
+    debugPrint(
+      '[Planner:checkMilestoneCompletion] REQUEST_PAYLOAD=${jsonEncode(logPayload)}',
+    );
+
+    final responseBuffer = StringBuffer();
+    final reasoningBuffer = StringBuffer();
+    _reasoningLogger?.call('checkMilestoneCompletion', '', false);
+    await for (final chunk in _openRouter.chatCompletionStream(
+      apiKey: openRouterKey,
+      model: model,
+      messages: requestMessages,
+    )) {
+      if (chunk.contentDelta.isNotEmpty) {
+        responseBuffer.write(chunk.contentDelta);
+      }
+      if (chunk.reasoningDelta.isNotEmpty) {
+        reasoningBuffer.write(chunk.reasoningDelta);
+        _reasoningLogger?.call(
+          'checkMilestoneCompletion',
+          reasoningBuffer.toString(),
+          false,
+        );
+      }
+    }
+
+    var raw = responseBuffer.toString();
+    var reasoning = reasoningBuffer.toString();
+    if (raw.trim().isEmpty) {
+      final completion = await _openRouter.chatCompletionDetailed(
+        apiKey: openRouterKey,
+        model: model,
+        messages: requestMessages,
+        includeReasoning: true,
+      );
+      raw = completion.content;
+      if (reasoning.trim().isEmpty) {
+        reasoning = completion.reasoning;
+      }
+    }
+    _reasoningLogger?.call('checkMilestoneCompletion', reasoning, true);
+
+    _traceLogger?.call(
+      PlannerTrace(
+        label: 'checkMilestoneCompletion',
+        model: model,
+        hasScreenshot: screenshotPath != null,
+        systemPrompt: systemPrompt,
+        userPrompt: userPrompt,
+        requestPayload: jsonEncode(logPayload),
+        rawResponse: raw,
+        reasoning: reasoning,
+      ),
+    );
+
+    debugPrint(
+      '[Planner:checkMilestoneCompletion] LLM raw response=${_toSingleLineLog(raw)}',
+    );
+    return _extractCompletionBoolean(raw) ?? false;
   }
 
   // -----------------------------------------------------------------------
   // Shared LLM call + JSON array parsing
   // -----------------------------------------------------------------------
 
-  Future<List<PlannedStep>> _callAndParsePlan({
+  Future<String> _callPlannerRaw({
     required String openRouterKey,
     required String model,
     required String systemPrompt,
@@ -454,13 +711,7 @@ Look at the current UI elements${screenshotPath != null ? ' and attached screens
 
     debugPrint('[Planner:$label] LLM raw response=${_toSingleLineLog(raw)}');
 
-    final steps = _extractJsonArray(raw);
-    if (steps == null || steps.isEmpty) {
-      debugPrint('[Planner:$label] Failed to parse JSON array');
-      return [];
-    }
-
-    return steps.map((s) => PlannedStep.fromJson(s)).toList();
+    return raw;
   }
 
   // -----------------------------------------------------------------------
@@ -579,6 +830,97 @@ Look at the current UI elements${screenshotPath != null ? ' and attached screens
       }
     }
     return null;
+  }
+
+  static bool? _extractCompletionBoolean(String raw) {
+    raw = raw.trim();
+    if (raw.isEmpty) return null;
+    try {
+      final parsed = jsonDecode(raw);
+      if (parsed is Map<String, dynamic>) {
+        final complete = parsed['complete'];
+        if (complete is bool) return complete;
+      }
+    } catch (_) {}
+
+    final start = raw.indexOf('{');
+    final end = raw.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        final parsed = jsonDecode(raw.substring(start, end + 1));
+        if (parsed is Map<String, dynamic>) {
+          final complete = parsed['complete'];
+          if (complete is bool) return complete;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  static MilestonePlan _parseMilestonePlan(
+    String raw,
+    String currentMilestone, {
+    bool recommendScreenshotOnAmbiguity = false,
+  }) {
+    final object = _extractJsonObject(raw);
+    if (object != null) {
+      final stepsRaw = object['steps'];
+      final steps = stepsRaw is List
+          ? stepsRaw
+                .whereType<Map<String, dynamic>>()
+                .map(PlannedStep.fromJson)
+                .toList()
+          : const <PlannedStep>[];
+      final contract = object['completion_contract'] is Map<String, dynamic>
+          ? CompletionContract.fromJson(
+              object['completion_contract'] as Map<String, dynamic>,
+            )
+          : CompletionContract(
+              primary: _defaultCompletionCriteria(currentMilestone),
+              recommendScreenshotOnAmbiguity: recommendScreenshotOnAmbiguity,
+            );
+      return MilestonePlan(steps: steps, completionContract: contract);
+    }
+
+    final steps = (_extractJsonArray(raw) ?? const <Map<String, dynamic>>[])
+        .map(PlannedStep.fromJson)
+        .toList();
+    return MilestonePlan(
+      steps: steps,
+      completionContract: CompletionContract(
+        primary: _defaultCompletionCriteria(currentMilestone),
+        recommendScreenshotOnAmbiguity: recommendScreenshotOnAmbiguity,
+      ),
+    );
+  }
+
+  static Map<String, dynamic>? _extractJsonObject(String raw) {
+    raw = raw.trim();
+    if (raw.isEmpty) return null;
+    try {
+      final parsed = jsonDecode(raw);
+      if (parsed is Map<String, dynamic>) return parsed;
+    } catch (_) {}
+
+    final start = raw.indexOf('{');
+    final end = raw.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        final parsed = jsonDecode(raw.substring(start, end + 1));
+        if (parsed is Map<String, dynamic>) return parsed;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  static VerifyCriteria _defaultCompletionCriteria(String milestone) {
+    final text = milestone.trim();
+    final words = text.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList();
+    final fragment = words.take(4).join(' ');
+    return VerifyCriteria(
+      type: fragment.isEmpty ? 'any' : 'text_visible',
+      labelContains: fragment,
+    );
   }
 
   static String _toSingleLineLog(String value) {

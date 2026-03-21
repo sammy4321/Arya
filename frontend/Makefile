@@ -46,12 +46,18 @@ run: check-flutter
 clean: check-flutter
 	@flutter clean
 	@rm -rf .dart_tool build
+	@rm -f "$$HOME/Library/Application Support/Arya/arya.db"
+	@rm -f "$$HOME/.local/share/Arya/arya.db"
+	@if [ -n "$$APPDATA" ]; then rm -f "$$APPDATA/Arya/arya.db"; fi
+	@rm -f "$$HOME/Library/Application Support/Arya/arya_ai_settings.db"
 	@rm -f "$$HOME/Library/Application Support/Arya/arya_file_vault.db"
 	@rm -f "$$HOME/Library/Application Support/arya_file_vault.db"
 	@find "$$HOME/Library/Application Support" -maxdepth 4 -name "arya_file_vault.db" -delete 2>/dev/null || true
+	@rm -f "$$HOME/.local/share/Arya/arya_ai_settings.db"
 	@rm -f "$$HOME/.local/share/Arya/arya_file_vault.db"
 	@rm -f "$$HOME/.local/share/arya_file_vault.db"
 	@find "$$HOME/.local/share" -maxdepth 4 -name "arya_file_vault.db" -delete 2>/dev/null || true
+	@if [ -n "$$APPDATA" ]; then rm -f "$$APPDATA/Arya/arya_ai_settings.db"; fi
 	@if [ -n "$$APPDATA" ]; then rm -f "$$APPDATA/Arya/arya_file_vault.db"; fi
 	@if [ -n "$$APPDATA" ]; then find "$$APPDATA" -maxdepth 4 -name "arya_file_vault.db" -delete 2>/dev/null || true; fi
 	@echo "Project artifacts cleaned."

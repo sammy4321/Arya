@@ -1,9 +1,6 @@
 enum SettingsTab {
-  general('General'),
   aiSettings('AI Settings'),
-  fileVault('File Vault'),
-  passwordVault('Password Vault'),
-  paymentVault('Payment Vault');
+  fileVault('File Vault');
 
   const SettingsTab(this.label);
 

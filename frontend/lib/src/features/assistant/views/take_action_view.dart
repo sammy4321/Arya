@@ -47,8 +47,12 @@ class _TakeActionViewState extends State<TakeActionView> {
   int? _targetAppPid;
   late final StepPlanner _planner;
   late final TaskStrategyPlanner _strategyPlanner;
-  StrategyResult? _activeStrategy;
-  String _resolvedAppName = '';
+  TaskDecomposition? _taskDecomposition;
+  final List<_MilestoneProgressItem> _milestoneProgress = [];
+  int _activeMilestoneIndex = 0;
+  int _activeApproachIndex = 0;
+  String _latestCompletionLabel = '';
+  String _latestCompletionReason = '';
 
   @override
   void initState() {
@@ -99,8 +103,12 @@ class _TakeActionViewState extends State<TakeActionView> {
       _pendingAttachments.clear();
       _latestScreenshotPath = null;
       _targetAppPid = null;
-      _activeStrategy = null;
-      _resolvedAppName = '';
+      _taskDecomposition = null;
+      _milestoneProgress.clear();
+      _activeMilestoneIndex = 0;
+      _activeApproachIndex = 0;
+      _latestCompletionLabel = '';
+      _latestCompletionReason = '';
       ActionExecutorService.instance.targetAppPid = null;
     });
     _controller.clear();
@@ -146,13 +154,14 @@ class _TakeActionViewState extends State<TakeActionView> {
   }
 
   // =========================================================================
-  // Plan-based execution loop
+  // Milestone-based execution loop
   //
-  // 1. Screenshot + UI parse → LLM generates FULL plan (one call).
-  // 2. Execute each step deterministically (no LLM between steps).
-  // 3. After each step: quick UI parse → check verify criteria.
-  // 4. If criteria pass → next step.
-  // 5. If criteria fail → screenshot + LLM re-plan (max _maxReplans).
+  // 1. First LLM call decomposes the task into milestones + approaches.
+  // 2. The UI-aware planner generates a plan only for the current milestone.
+  // 3. Execution proceeds deterministically with per-step verification.
+  // 4. Re-plan stays within the same milestone/approach while recoverable.
+  // 5. If the current approach is exhausted for the milestone, try next one.
+  // 6. After milestone completion, advance to the next milestone.
   // =========================================================================
 
   Future<void> _runPlanBasedLoop({
@@ -163,6 +172,9 @@ class _TakeActionViewState extends State<TakeActionView> {
     final store = AiSettingsStore.instance;
     final openRouterKey = await store.getApiKey();
     final tavilyKey = await store.getTavilyApiKey();
+    final decompositionModel = await store.getDecompositionModel();
+    final planningModel = await store.getPlanningModel();
+    final completionModel = await store.getCompletionModel();
 
     if (openRouterKey.isEmpty) {
       _setAbort('OpenRouter API key is missing. Set it in Settings.');
@@ -190,229 +202,545 @@ class _TakeActionViewState extends State<TakeActionView> {
     );
 
     final attachmentMaps = attachments.map(_toAttachmentMap).toList();
-    final history = <Map<String, String>>[];
-
-    // --- Phase 1: Initial capture (UI elements only) + full plan ---
+    // --- Phase 1: Initial capture + decomposition prepass ---
     if (mounted) setState(() => _isPlanning = true);
     await _captureContext('Initial context', region: captureRegion);
     final appContext = await _buildTargetAppContext();
-    final plannerScreenContext = {...screenContext, ...appContext};
-    _resolvedAppName =
+    final appName =
         (appContext['target_app_name'] as String?)?.trim().toLowerCase() ?? '';
-
-    // Strategy resolution — cache probe → LLM fallback.
-    String strategyHint = '';
     try {
-      final strategy = await _strategyPlanner.resolve(
+      final decomposition = await _strategyPlanner.decompose(
         openRouterKey: openRouterKey,
-        model: model,
+        model: decompositionModel,
         task: task,
-        appName: _resolvedAppName,
+        appName: appName,
       );
-      if (strategy != null) {
-        _activeStrategy = strategy;
-        strategyHint = strategy.bestApproachText;
-        _log(
-          'Strategy resolved (${strategy.source}): '
-          'pattern="${strategy.taskPattern}" '
-          'approach="${strategyHint.length > 80 ? '${strategyHint.substring(0, 80)}…' : strategyHint}"',
-        );
+      if (!mounted || !_isLoading) return;
+      setState(() {
+        _taskDecomposition = decomposition;
+        _milestoneProgress
+          ..clear()
+          ..addAll(
+            [
+              for (var i = 0; i < decomposition.milestones.length; i++)
+                _MilestoneProgressItem(
+                  title: decomposition.milestones[i],
+                  status: i == 0 ? 'active' : 'pending',
+                  detail: i == 0 ? 'Preparing first approach' : '',
+                  approaches: [
+                    for (final approach in decomposition.approaches)
+                      _ApproachProgressItem(title: approach.title, status: 'pending'),
+                  ],
+                ),
+            ],
+          );
+        _activeMilestoneIndex = 0;
+        _activeApproachIndex = 0;
+      });
+      _log(
+        'Pre-plan (${decomposition.source}): '
+        '${decomposition.milestones.length} milestones, '
+        '${decomposition.approaches.length} approaches',
+      );
+      for (var i = 0; i < decomposition.milestones.length; i++) {
+        _log('  Milestone ${i + 1}: ${decomposition.milestones[i]}');
       }
-    } catch (e) {
-      debugPrint('[Strategy] Error during resolve: $e');
-    }
 
-    _log('Generating plan…');
-    List<PlannedStep> plan;
-    try {
-      plan = await _planner.generateFullPlan(
-        openRouterKey: openRouterKey,
-        model: model,
-        task: task,
-        screenContext: plannerScreenContext,
-        uiContext: formatUIElementsForPrompt(_latestUIElements),
-        screenshotPath: _latestScreenshotPath,
-        tavilyKey: tavilyKey,
-        webMode: _webMode,
-        attachments: attachmentMaps,
-        strategyHint: strategyHint,
-      );
-    } catch (e) {
       if (mounted) setState(() => _isPlanning = false);
-      _setAbort('Plan generation failed: $e');
-      return;
-    }
 
-    if (mounted) setState(() => _isPlanning = false);
-
-    if (plan.isEmpty) {
-      _setAbort('LLM returned an empty plan.');
-      return;
-    }
-
-    _setPlanSteps(plan);
-    _log('Plan: ${plan.length} steps');
-    for (final s in plan) {
-      _log('  ${s.id}: ${s.title} [${s.action}]');
-    }
-
-    // --- Phase 2: Deterministic execution with completion verification ---
-    var replansUsed = 0;
-    var totalSteps = 0;
-    PlannedStep? lastExecutedStep;
-
-    while (totalSteps < _maxSteps) {
-      // Execute current plan steps.
-      while (plan.isNotEmpty && totalSteps < _maxSteps) {
+      var totalSteps = 0;
+      for (var milestoneIndex = 0;
+          milestoneIndex < decomposition.milestones.length;
+          milestoneIndex++) {
         if (!mounted || !_isLoading) return;
 
-        final step = plan.removeAt(0);
-        totalSteps++;
-        lastExecutedStep = step;
+        final milestone = decomposition.milestones[milestoneIndex];
+        final completedMilestones =
+            decomposition.milestones.take(milestoneIndex).toList();
+        var milestoneCompleted = false;
 
-        _updateStep(step.id, 'started', '');
-        _log('Executing: ${step.title}');
-
-        final stepMap = step.toStepMap();
-        final resolvedStep = _resolveClickTarget(stepMap, _latestUIElements);
-        final resolvedEl =
-            (resolvedStep['args'] as Map?)?['_resolved_element'] as String?;
-        if (resolvedEl != null) {
-          _log('  → Target: $resolvedEl');
-        }
-        final adjustedStep = resolvedStep;
-
-        final result = await ActionExecutorService.instance.executeStep(
-          adjustedStep,
+        _log(
+          'Starting milestone ${milestoneIndex + 1}/${decomposition.milestones.length}: '
+          '$milestone',
+        );
+        _setMilestoneStatus(
+          milestoneIndex,
+          'active',
+          detail: 'Working on this milestone',
         );
 
-        if (!result.ok) {
-          _updateStep(step.id, 'failed', result.detail);
-          _log('FAILED: ${step.title} — ${result.detail}');
-          history.add({
-            'step_id': step.id,
-            'title': step.title,
-            'status': 'failed',
-            'detail': result.detail,
-          });
+        for (var approachIndex = 0;
+            approachIndex < decomposition.approaches.length;
+            approachIndex++) {
+          if (!mounted || !_isLoading) return;
+          if (milestoneCompleted) break;
 
-          if (replansUsed >= _maxReplans) {
-            _setAbort('Max re-plans ($replansUsed) exhausted.');
-            _recordStrategyOutcome(success: false);
+          final approach = decomposition.approaches[approachIndex];
+          final milestoneStrategy =
+              approach.strategyForMilestone(milestoneIndex, milestone);
+          final fallbackApproachTitles = decomposition.approaches
+              .skip(approachIndex + 1)
+              .map((a) => a.title)
+              .toList();
+
+          setState(() {
+            _activeMilestoneIndex = milestoneIndex;
+            _activeApproachIndex = approachIndex;
+          });
+          _setApproachStatus(
+            milestoneIndex,
+            approachIndex,
+            'active',
+            detail: 'Current approach',
+          );
+
+          if (milestoneIndex != 0 || approachIndex != 0) {
+            await _captureContext('Milestone context', region: captureRegion);
+          }
+
+          final plannerScreenContext = {
+            ...screenContext,
+            ...await _buildTargetAppContext(),
+          };
+
+          if (mounted) setState(() => _isPlanning = true);
+          _log(
+            'Planning milestone ${milestoneIndex + 1} with approach '
+            '${approachIndex + 1}/${decomposition.approaches.length}: '
+            '${approach.title}',
+          );
+
+          late MilestonePlan milestonePlan;
+          List<PlannedStep> plan;
+          try {
+            milestonePlan = await _planner.generateFullPlan(
+              openRouterKey: openRouterKey,
+              model: planningModel,
+              task: task,
+              milestones: decomposition.milestones,
+              milestoneIndex: milestoneIndex,
+              approachTitle: approach.title,
+              milestoneStrategy: milestoneStrategy,
+              completedMilestones: completedMilestones,
+              fallbackApproachTitles: fallbackApproachTitles,
+              screenContext: plannerScreenContext,
+              uiContext: formatUIElementsForPrompt(_latestUIElements),
+              screenshotPath: null,
+              tavilyKey: tavilyKey,
+              webMode: _webMode,
+              attachments: attachmentMaps,
+            );
+            plan = List<PlannedStep>.from(milestonePlan.steps);
+          } catch (e) {
+            if (mounted) setState(() => _isPlanning = false);
+            _log('Plan generation failed for approach "${approach.title}": $e');
+            _setPlanSteps(const <PlannedStep>[]);
+            if (approachIndex + 1 < decomposition.approaches.length) {
+              _setApproachStatus(
+                milestoneIndex,
+                approachIndex,
+                'failed',
+                detail: 'Planning failed',
+              );
+              _log(
+                'Milestone ${milestoneIndex + 1}: '
+                'approach ${approachIndex + 1} failed, trying approach '
+                '${approachIndex + 2}.',
+              );
+              continue;
+            }
+            _setAbort(
+              'Unable to plan milestone ${milestoneIndex + 1}: $milestone',
+            );
             return;
           }
-          plan = await _replan(
-            task: task,
-            model: model,
-            openRouterKey: openRouterKey,
-            screenContext: screenContext,
-            history: history,
-            failedStep: step,
-            failureDetail: 'Execution failed: ${result.detail}',
-            remainingSteps: plan,
-            captureRegion: captureRegion,
+          if (mounted) setState(() => _isPlanning = false);
+
+          if (plan.isEmpty) {
+            _log('✓ Milestone ${milestoneIndex + 1} already complete.');
+            milestoneCompleted = true;
+            _setApproachStatus(
+              milestoneIndex,
+              approachIndex,
+              'completed',
+              detail: 'Milestone already satisfied',
+            );
+            _setMilestoneStatus(
+              milestoneIndex,
+              'completed',
+              detail: 'Already complete',
+            );
+            _setPlanSteps(const <PlannedStep>[]);
+            break;
+          }
+
+          final history = <Map<String, String>>[];
+          var replansUsed = 0;
+          var approachExhausted = false;
+          PlannedStep? lastExecutedStep;
+
+          _setPlanSteps(
+            plan,
+            milestoneIndex: milestoneIndex,
+            approachTitle: approach.title,
           );
-          _setPlanSteps(plan);
-          replansUsed++;
-          continue;
+          _log('Plan: ${plan.length} steps');
+          for (final s in plan) {
+            _log('  ${s.id}: ${s.title} [${s.action}]');
+          }
+
+          while (!milestoneCompleted &&
+              !approachExhausted &&
+              totalSteps < _maxSteps) {
+            while (plan.isNotEmpty && totalSteps < _maxSteps) {
+              if (!mounted || !_isLoading) return;
+
+              final step = plan.removeAt(0);
+              totalSteps++;
+              lastExecutedStep = step;
+
+              _updateStep(step.id, 'started', '');
+              _log('Executing: ${step.title}');
+
+              final stepMap = step.toStepMap();
+              final resolvedStep = _resolveClickTarget(stepMap, _latestUIElements);
+              final resolvedEl =
+                  (resolvedStep['args'] as Map?)?['_resolved_element'] as String?;
+              if (resolvedEl != null) {
+                _log('  → Target: $resolvedEl');
+              }
+
+              final result = await ActionExecutorService.instance.executeStep(
+                resolvedStep,
+              );
+
+              if (!result.ok) {
+                _updateStep(step.id, 'failed', result.detail);
+                _log('FAILED: ${step.title} — ${result.detail}');
+                history.add({
+                  'step_id': step.id,
+                  'title': step.title,
+                  'status': 'failed',
+                  'detail': result.detail,
+                });
+
+                if (replansUsed >= _maxReplans) {
+                  approachExhausted = true;
+                  _setApproachStatus(
+                    milestoneIndex,
+                    approachIndex,
+                    'failed',
+                    detail: 'Execution retries exhausted',
+                  );
+                  _log(
+                    'Approach "${approach.title}" exhausted for milestone '
+                    '${milestoneIndex + 1}.',
+                  );
+                  break;
+                }
+
+                milestonePlan = await _replan(
+                  task: task,
+                  milestones: decomposition.milestones,
+                  milestoneIndex: milestoneIndex,
+                  approachTitle: approach.title,
+                  milestoneStrategy: milestoneStrategy,
+                  completedMilestones: completedMilestones,
+                  fallbackApproachTitles: fallbackApproachTitles,
+                  model: planningModel,
+                  openRouterKey: openRouterKey,
+                  screenContext: screenContext,
+                  history: history,
+                  failedStep: step,
+                  failureDetail: 'Execution failed: ${result.detail}',
+                  remainingSteps: plan,
+                  captureRegion: captureRegion,
+                );
+                plan = List<PlannedStep>.from(milestonePlan.steps);
+                _setPlanSteps(
+                  plan,
+                  milestoneIndex: milestoneIndex,
+                  approachTitle: approach.title,
+                );
+                replansUsed++;
+                continue;
+              }
+
+              history.add({
+                'step_id': step.id,
+                'title': step.title,
+                'status': 'completed',
+                'detail': result.detail,
+              });
+              _updateStep(step.id, 'completed', result.detail);
+              _log('${step.title}: ${result.detail}');
+
+              if (step.thenChain != null) {
+                await _executeChainedActions(
+                  stepMap,
+                  stepId: step.id,
+                  history: history,
+                );
+              }
+
+              await Future.delayed(const Duration(milliseconds: 500));
+              final verifyElements = await UIParserService.instance.parseScreen(
+                targetPid: _targetAppPid,
+              );
+              _latestUIElements = verifyElements;
+
+              final passed = step.verify.check(verifyElements);
+              if (passed) {
+                _log('✓ Verify passed: ${step.verify}');
+                continue;
+              }
+
+              _log('✗ Verify FAILED: ${step.verify}');
+              if (replansUsed >= _maxReplans) {
+                approachExhausted = true;
+                _setApproachStatus(
+                  milestoneIndex,
+                  approachIndex,
+                  'failed',
+                  detail: 'Verification retries exhausted',
+                );
+                _log(
+                  'Approach "${approach.title}" exhausted for milestone '
+                  '${milestoneIndex + 1}.',
+                );
+                break;
+              }
+
+              milestonePlan = await _replan(
+                task: task,
+                milestones: decomposition.milestones,
+                milestoneIndex: milestoneIndex,
+                approachTitle: approach.title,
+                milestoneStrategy: milestoneStrategy,
+                completedMilestones: completedMilestones,
+                fallbackApproachTitles: fallbackApproachTitles,
+                model: planningModel,
+                openRouterKey: openRouterKey,
+                screenContext: screenContext,
+                history: history,
+                failedStep: step,
+                failureDetail: 'Verification failed: expected ${step.verify}',
+                remainingSteps: plan,
+                captureRegion: captureRegion,
+              );
+              plan = List<PlannedStep>.from(milestonePlan.steps);
+              _setPlanSteps(
+                plan,
+                milestoneIndex: milestoneIndex,
+                approachTitle: approach.title,
+              );
+              replansUsed++;
+            }
+
+            if (_abortReason != null || !mounted || !_isLoading) return;
+            if (approachExhausted ||
+                milestoneCompleted ||
+                totalSteps >= _maxSteps) {
+              break;
+            }
+            if (lastExecutedStep == null) {
+              approachExhausted = true;
+              break;
+            }
+
+            final localCompletion = _evaluateCompletionContract(
+              milestonePlan.completionContract,
+              _latestUIElements,
+            );
+            _log(
+              'Local completion check: ${localCompletion.label} '
+              '(${localCompletion.reason})',
+            );
+            if (mounted) {
+              setState(() {
+                _latestCompletionLabel = localCompletion.label;
+                _latestCompletionReason = localCompletion.reason;
+              });
+            }
+
+            var milestoneComplete = localCompletion.isComplete;
+            if (localCompletion.isAmbiguous &&
+                milestonePlan.completionContract.requiresLlmIfUnclear) {
+              _log('Ambiguous completion, escalating to LLM check…');
+              if (milestonePlan
+                  .completionContract
+                  .recommendScreenshotOnAmbiguity) {
+                await _captureContext(
+                  'Milestone ambiguity context',
+                  captureScreenshot: true,
+                  region: captureRegion,
+                );
+              }
+              final plannerScreenContext = {
+                ...screenContext,
+                ...await _buildTargetAppContext(),
+              };
+              milestoneComplete = await _planner.checkMilestoneCompletion(
+                openRouterKey: openRouterKey,
+                model: completionModel,
+                task: task,
+                milestones: decomposition.milestones,
+                milestoneIndex: milestoneIndex,
+                approachTitle: approach.title,
+                milestoneStrategy: milestoneStrategy,
+                completedMilestones: completedMilestones,
+                screenContext: plannerScreenContext,
+                uiContext: formatUIElementsForPrompt(_latestUIElements),
+                screenshotPath: milestonePlan
+                        .completionContract
+                        .recommendScreenshotOnAmbiguity
+                    ? _latestScreenshotPath
+                    : null,
+              );
+              _log(
+                milestoneComplete
+                    ? 'LLM completion check: complete'
+                    : 'LLM completion check: incomplete',
+              );
+              if (mounted) {
+                setState(() {
+                  _latestCompletionLabel =
+                      milestoneComplete ? 'complete' : 'incomplete';
+                  _latestCompletionReason = milestoneComplete
+                      ? 'Confirmed by LLM completion check'
+                      : 'LLM determined milestone is incomplete';
+                });
+              }
+            }
+
+            if (milestoneComplete) {
+              _log('✓ Milestone ${milestoneIndex + 1} complete.');
+              milestoneCompleted = true;
+              _setApproachStatus(
+                milestoneIndex,
+                approachIndex,
+                'completed',
+                detail: 'Completed this milestone',
+              );
+              _setMilestoneStatus(
+                milestoneIndex,
+                'completed',
+                detail: _latestCompletionReason,
+              );
+              _setPlanSteps(const <PlannedStep>[]);
+              break;
+            }
+
+            _log('Milestone incomplete, requesting additional steps…');
+            milestonePlan = await _replan(
+              task: task,
+              milestones: decomposition.milestones,
+              milestoneIndex: milestoneIndex,
+              approachTitle: approach.title,
+              milestoneStrategy: milestoneStrategy,
+              completedMilestones: completedMilestones,
+              fallbackApproachTitles: fallbackApproachTitles,
+              model: planningModel,
+              openRouterKey: openRouterKey,
+              screenContext: screenContext,
+              history: history,
+              failedStep: lastExecutedStep,
+              failureDetail:
+                  'All planned steps for milestone "$milestone" were executed, '
+                  'but the milestone is not yet complete in the current UI '
+                  'state. Produce additional steps for the same milestone.',
+              remainingSteps: const [],
+              captureRegion: captureRegion,
+            );
+            plan = List<PlannedStep>.from(milestonePlan.steps);
+
+            if (replansUsed >= _maxReplans) {
+              approachExhausted = true;
+              _setApproachStatus(
+                milestoneIndex,
+                approachIndex,
+                'failed',
+                detail: 'Milestone remained incomplete',
+              );
+              _setPlanSteps(const <PlannedStep>[]);
+              _log(
+                'Approach "${approach.title}" exhausted for milestone '
+                '${milestoneIndex + 1}.',
+              );
+              break;
+            }
+
+            _log('Milestone needs ${plan.length} more steps.');
+            _setPlanSteps(
+              plan,
+              milestoneIndex: milestoneIndex,
+              approachTitle: approach.title,
+            );
+            replansUsed++;
+          }
+
+          if (milestoneCompleted) {
+            break;
+          }
+
+          _setPlanSteps(const <PlannedStep>[]);
+          if (totalSteps >= _maxSteps) {
+            _setAbort('Reached maximum step limit ($_maxSteps).');
+            return;
+          }
+          if (approachIndex + 1 < decomposition.approaches.length) {
+            _setApproachStatus(
+              milestoneIndex,
+              approachIndex,
+              'failed',
+              detail: 'Switching to next approach',
+            );
+            _log(
+              'Milestone ${milestoneIndex + 1}: approach ${approachIndex + 1} '
+              'failed, trying approach ${approachIndex + 2}.',
+            );
+          }
         }
 
-        // Execution succeeded.
-        history.add({
-          'step_id': step.id,
-          'title': step.title,
-          'status': 'completed',
-          'detail': result.detail,
-        });
-        _updateStep(step.id, 'completed', result.detail);
-        _log('${step.title}: ${result.detail}');
-
-        if (step.thenChain != null) {
-          await _executeChainedActions(
-            stepMap,
-            stepId: step.id,
-            history: history,
+        if (!milestoneCompleted) {
+          _setMilestoneStatus(
+            milestoneIndex,
+            'failed',
+            detail: 'All approaches exhausted',
           );
-        }
-
-        // --- Per-step verification ---
-        await Future.delayed(const Duration(milliseconds: 500));
-        final verifyElements = await UIParserService.instance.parseScreen(
-          targetPid: _targetAppPid,
-        );
-        _latestUIElements = verifyElements;
-
-        final passed = step.verify.check(verifyElements);
-        if (passed) {
-          _log('✓ Verify passed: ${step.verify}');
-          continue;
-        }
-
-        _log('✗ Verify FAILED: ${step.verify}');
-        if (replansUsed >= _maxReplans) {
-          _setAbort('Verification failed and max re-plans exhausted.');
-          _recordStrategyOutcome(success: false);
+          _setAbort(
+            'All approaches exhausted for milestone '
+            '${milestoneIndex + 1}: $milestone',
+          );
           return;
         }
 
-        plan = await _replan(
-          task: task,
-          model: model,
-          openRouterKey: openRouterKey,
-          screenContext: screenContext,
-          history: history,
-          failedStep: step,
-          failureDetail: 'Verification failed: expected ${step.verify}',
-          remainingSteps: plan,
-          captureRegion: captureRegion,
-        );
-        _setPlanSteps(plan);
-        replansUsed++;
+        if (milestoneIndex + 1 < decomposition.milestones.length) {
+          _setMilestoneStatus(
+            milestoneIndex + 1,
+            'active',
+            detail: 'Queued next milestone',
+          );
+        }
       }
 
-      // --- Task-level completion check ---
-      if (_abortReason != null || !mounted || !_isLoading) return;
-      if (totalSteps >= _maxSteps || lastExecutedStep == null) break;
-      if (replansUsed >= _maxReplans) break;
-
-      _log('Verifying task completion…');
-      plan = await _replan(
-        task: task,
-        model: model,
-        openRouterKey: openRouterKey,
-        screenContext: plannerScreenContext,
-        history: history,
-        failedStep: lastExecutedStep,
-        failureDetail:
-            'All planned steps were executed. '
-            'Verify whether the original task "$task" was fully '
-            'accomplished by examining the current UI state. '
-            'Return an empty array [] if complete, '
-            'or provide additional steps if more work is needed.',
-        remainingSteps: [],
-        captureRegion: captureRegion,
-      );
-
-      if (plan.isEmpty) {
-        _log('✓ Task verified as complete.');
-        _recordStrategyOutcome(success: true);
-        break;
-      }
-
-      _log('Task needs ${plan.length} more steps.');
-      _setPlanSteps(plan);
-      replansUsed++;
-    }
-
-    if (totalSteps >= _maxSteps) {
-      _log('Reached maximum step limit ($_maxSteps).');
-      _recordStrategyOutcome(success: false);
+      _log('✓ Task verified as complete.');
+    } catch (e) {
+      if (mounted) setState(() => _isPlanning = false);
+      _setAbort('Pre-planning failed: $e');
+      return;
     }
   }
 
   /// Captures fresh context and calls LLM to produce a new plan.
-  Future<List<PlannedStep>> _replan({
+  Future<MilestonePlan> _replan({
     required String task,
+    required List<String> milestones,
+    required int milestoneIndex,
+    required String approachTitle,
+    required String milestoneStrategy,
+    required List<String> completedMilestones,
+    required List<String> fallbackApproachTitles,
     required String model,
     required String openRouterKey,
     required Map<String, dynamic> screenContext,
@@ -438,6 +766,12 @@ class _TakeActionViewState extends State<TakeActionView> {
         openRouterKey: openRouterKey,
         model: model,
         task: task,
+        milestones: milestones,
+        milestoneIndex: milestoneIndex,
+        approachTitle: approachTitle,
+        milestoneStrategy: milestoneStrategy,
+        completedMilestones: completedMilestones,
+        fallbackApproachTitles: fallbackApproachTitles,
         screenContext: plannerScreenContext,
         uiContext: formatUIElementsForPrompt(_latestUIElements),
         history: history,
@@ -446,14 +780,20 @@ class _TakeActionViewState extends State<TakeActionView> {
         remainingSteps: remainingSteps,
         screenshotPath: _latestScreenshotPath,
       );
-      _log('Re-plan received: ${newPlan.length} steps');
-      for (final s in newPlan) {
+      _log('Re-plan received: ${newPlan.steps.length} steps');
+      for (final s in newPlan.steps) {
         _log('  ${s.id}: ${s.title} [${s.action}] verify=${s.verify}');
       }
       return newPlan;
     } catch (e) {
       _log('Re-plan failed: $e');
-      return [];
+      return MilestonePlan(
+        steps: const [],
+        completionContract: const CompletionContract(
+          primary: VerifyCriteria(type: 'any'),
+          recommendScreenshotOnAmbiguity: true,
+        ),
+      );
     }
   }
 
@@ -752,6 +1092,42 @@ class _TakeActionViewState extends State<TakeActionView> {
     });
   }
 
+  void _setMilestoneStatus(int milestoneIndex, String status, {String detail = ''}) {
+    if (!mounted) return;
+    if (milestoneIndex < 0 || milestoneIndex >= _milestoneProgress.length) return;
+    setState(() {
+      final current = _milestoneProgress[milestoneIndex];
+      _milestoneProgress[milestoneIndex] = current.copyWith(
+        status: status,
+        detail: detail.isNotEmpty ? detail : current.detail,
+      );
+    });
+  }
+
+  void _setApproachStatus(
+    int milestoneIndex,
+    int approachIndex,
+    String status, {
+    String detail = '',
+  }) {
+    if (!mounted) return;
+    if (milestoneIndex < 0 || milestoneIndex >= _milestoneProgress.length) return;
+    final milestone = _milestoneProgress[milestoneIndex];
+    if (approachIndex < 0 || approachIndex >= milestone.approaches.length) return;
+    setState(() {
+      final updatedApproaches = List<_ApproachProgressItem>.from(
+        _milestoneProgress[milestoneIndex].approaches,
+      );
+      final current = updatedApproaches[approachIndex];
+      updatedApproaches[approachIndex] = current.copyWith(
+        status: status,
+        detail: detail.isNotEmpty ? detail : current.detail,
+      );
+      _milestoneProgress[milestoneIndex] = _milestoneProgress[milestoneIndex]
+          .copyWith(approaches: updatedApproaches);
+    });
+  }
+
   void _updateStep(String id, String status, String detail) {
     if (!mounted) return;
     setState(() {
@@ -762,13 +1138,24 @@ class _TakeActionViewState extends State<TakeActionView> {
     });
   }
 
-  void _setPlanSteps(List<PlannedStep> plan) {
+  void _setPlanSteps(
+    List<PlannedStep> plan, {
+    int? milestoneIndex,
+    String? approachTitle,
+  }) {
     if (!mounted) return;
     setState(() {
       _steps.removeWhere((s) => s.status == 'pending');
       for (final s in plan) {
         _steps.add(
-          _ActionStep(id: s.id, title: s.title, status: 'pending', detail: ''),
+          _ActionStep(
+            id: s.id,
+            title: s.title,
+            status: 'pending',
+            detail: '',
+            milestoneIndex: milestoneIndex,
+            approachTitle: approachTitle,
+          ),
         );
       }
     });
@@ -794,22 +1181,40 @@ class _TakeActionViewState extends State<TakeActionView> {
     });
   }
 
-  void _recordStrategyOutcome({required bool success}) {
-    final strategy = _activeStrategy;
-    if (strategy == null || _resolvedAppName.isEmpty) return;
-    if (success) {
-      _strategyPlanner.recordSuccess(
-        appName: _resolvedAppName,
-        taskPattern: strategy.taskPattern,
+  _LocalCompletionResult _evaluateCompletionContract(
+    CompletionContract contract,
+    List<UIElement> elements,
+  ) {
+    final hasMeaningfulPrimary = contract.primary.type != 'any';
+    final primaryPass = contract.primary.check(elements);
+    final secondaryPasses = contract.secondary
+        .where((criteria) => criteria.check(elements))
+        .length;
+
+    if (!hasMeaningfulPrimary && contract.secondary.isEmpty) {
+      return const _LocalCompletionResult.ambiguous(
+        'No machine-readable completion criteria',
       );
-      _log('Strategy "${strategy.taskPattern}" marked as successful.');
-    } else {
-      _strategyPlanner.recordFailure(
-        appName: _resolvedAppName,
-        taskPattern: strategy.taskPattern,
-      );
-      _log('Strategy "${strategy.taskPattern}" marked as failed.');
     }
+    if (primaryPass && contract.secondary.isEmpty) {
+      return const _LocalCompletionResult.complete('Primary criterion passed');
+    }
+    if (primaryPass && secondaryPasses > 0) {
+      return _LocalCompletionResult.complete(
+        'Primary + $secondaryPasses secondary criteria passed',
+      );
+    }
+    if (primaryPass && contract.secondary.isNotEmpty && secondaryPasses == 0) {
+      return const _LocalCompletionResult.ambiguous(
+        'Primary passed but secondary criteria did not confirm',
+      );
+    }
+    if (!primaryPass && secondaryPasses > 0) {
+      return _LocalCompletionResult.ambiguous(
+        '$secondaryPasses secondary criteria passed without primary',
+      );
+    }
+    return const _LocalCompletionResult.incomplete('Primary criterion failed');
   }
 
   bool _looksLikeThinkingModel(String model) {
@@ -988,7 +1393,36 @@ class _TakeActionViewState extends State<TakeActionView> {
       );
     }
 
-    final isComplete = !_isLoading && _steps.isNotEmpty && _abortReason == null;
+    final isComplete = !_isLoading &&
+        _taskDecomposition != null &&
+        _milestoneProgress.isNotEmpty &&
+        _milestoneProgress.every((item) => item.status == 'completed') &&
+        _abortReason == null;
+    final totalMilestones = _taskDecomposition?.milestones.length ?? 0;
+    final completedMilestones =
+        _milestoneProgress.where((item) => item.status == 'completed').length;
+    final safeMilestoneIndex = _milestoneProgress.isEmpty
+        ? 0
+        : _activeMilestoneIndex.clamp(0, _milestoneProgress.length - 1);
+    final activeMilestone = _milestoneProgress.isEmpty
+        ? null
+        : _milestoneProgress[safeMilestoneIndex];
+    final safeApproachIndex =
+        activeMilestone == null || activeMilestone.approaches.isEmpty
+        ? 0
+        : _activeApproachIndex.clamp(
+            0,
+            activeMilestone.approaches.length - 1,
+          );
+    final activeApproach =
+        activeMilestone == null || activeMilestone.approaches.isEmpty
+        ? null
+        : activeMilestone.approaches[safeApproachIndex];
+    final groupedSteps = <int, List<_ActionStep>>{};
+    for (final step in _steps) {
+      final key = step.milestoneIndex ?? -1;
+      groupedSteps.putIfAbsent(key, () => <_ActionStep>[]).add(step);
+    }
 
     return SelectionArea(
       child: ListView(
@@ -1002,31 +1436,86 @@ class _TakeActionViewState extends State<TakeActionView> {
             ),
             const SizedBox(height: 16),
           ],
-          if (_activeStrategy != null) ...[
-            _StrategyBadge(strategy: _activeStrategy!),
-            const SizedBox(height: 8),
-          ],
-          if (_isPlanning) ...[
-            const _PlanningIndicator(),
+          _SummaryCard(
+            task: _taskText,
+            totalMilestones: totalMilestones,
+            completedMilestones: completedMilestones,
+            isRunning: _isLoading,
+            isPlanning: _isPlanning,
+            abortReason: _abortReason,
+            totalSteps: _steps.length,
+          ),
+          if (_taskDecomposition != null) ...[
             const SizedBox(height: 12),
-          ],
-          if (_isThinkingModelSelected &&
-              (_isPlanning ||
-                  _isPlannerThinking ||
-                  _latestPlannerReasoning.isNotEmpty)) ...[
-            _PlannerReasoningBanner(
-              isThinking: _isPlanning || _isPlannerThinking,
-              reasoning: _latestPlannerReasoning,
-            ),
-            const SizedBox(height: 12),
-          ],
-          if (_steps.isNotEmpty)
-            for (var i = 0; i < _steps.length; i++)
-              _StepTimelineRow(
-                step: _steps[i],
-                isFirst: i == 0,
-                isLast: i == _steps.length - 1,
+            _SectionCard(
+              title: 'Milestones',
+              subtitle: 'Progress across milestones and fallback approaches',
+              icon: Icons.route_outlined,
+              child: _MilestoneProgressBoard(
+                milestones: _milestoneProgress,
+                activeMilestoneIndex: _activeMilestoneIndex,
+                activeApproachIndex: _activeApproachIndex,
               ),
+            ),
+          ],
+          if (activeMilestone != null) ...[
+            const SizedBox(height: 12),
+            _SectionCard(
+              title: 'Active execution',
+              subtitle: 'Current milestone, selected approach, and completion state',
+              icon: Icons.bolt_outlined,
+              child: _ActiveMilestoneCard(
+                milestoneTitle: activeMilestone.title,
+                milestoneIndex: _activeMilestoneIndex,
+                totalMilestones: totalMilestones,
+                milestoneStatus: activeMilestone.status,
+                milestoneDetail: activeMilestone.detail,
+                approachTitle: activeApproach?.title ?? 'Waiting for approach',
+                approachStatus: activeApproach?.status ?? 'pending',
+                approachDetail: activeApproach?.detail ?? '',
+                completionLabel: _latestCompletionLabel,
+                completionReason: _latestCompletionReason,
+                isPlanning: _isPlanning,
+              ),
+            ),
+          ],
+          if (_steps.isNotEmpty || _isPlanning) ...[
+            const SizedBox(height: 12),
+            _SectionCard(
+              title: 'Execution',
+              subtitle: 'Grouped by milestone so active work stays easy to scan',
+              icon: Icons.timeline_outlined,
+              child: Column(
+                children: [
+                  if (_isPlanning) ...[
+                    const _PlanningIndicator(),
+                    const SizedBox(height: 12),
+                  ],
+                  if (_steps.isNotEmpty)
+                    for (final entry in groupedSteps.entries)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: _MilestoneStepGroup(
+                          title: entry.key >= 0 &&
+                                  entry.key < _milestoneProgress.length
+                              ? _milestoneProgress[entry.key].title
+                              : 'Execution history',
+                          subtitle: entry.key >= 0 &&
+                                  entry.key < _milestoneProgress.length
+                              ? _milestoneProgress[entry.key]
+                                  .approaches
+                                  .where((item) => item.status != 'pending')
+                                  .map((item) => item.title)
+                                  .join(' • ')
+                              : '',
+                          steps: entry.value,
+                          isActive: entry.key == _activeMilestoneIndex,
+                        ),
+                      ),
+                ],
+              ),
+            ),
+          ],
           if (isComplete) ...[
             const SizedBox(height: 8),
             const _ResultBanner(
@@ -1043,11 +1532,38 @@ class _TakeActionViewState extends State<TakeActionView> {
               text: _abortReason!,
             ),
           ],
-          if (_logs.isNotEmpty || _plannerTraces.isNotEmpty) ...[
-            const SizedBox(height: 14),
-            _CollapsibleLogSection(
-              logs: _logs,
-              plannerTraces: _plannerTraces,
+          if ((_isThinkingModelSelected &&
+                  (_isPlanning ||
+                      _isPlannerThinking ||
+                      _latestPlannerReasoning.isNotEmpty)) ||
+              _logs.isNotEmpty ||
+              _plannerTraces.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            _SectionCard(
+              title: 'Diagnostics',
+              subtitle: 'Reasoning, activity, and planner traces',
+              icon: Icons.analytics_outlined,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (_isThinkingModelSelected &&
+                      (_isPlanning ||
+                          _isPlannerThinking ||
+                          _latestPlannerReasoning.isNotEmpty)) ...[
+                    _PlannerReasoningBanner(
+                      isThinking: _isPlanning || _isPlannerThinking,
+                      reasoning: _latestPlannerReasoning,
+                    ),
+                    if (_logs.isNotEmpty || _plannerTraces.isNotEmpty)
+                      const SizedBox(height: 12),
+                  ],
+                  if (_logs.isNotEmpty || _plannerTraces.isNotEmpty)
+                    _CollapsibleLogSection(
+                      logs: _logs,
+                      plannerTraces: _plannerTraces,
+                    ),
+                ],
+              ),
             ),
           ],
         ],
@@ -1189,22 +1705,115 @@ class _ActionStep {
     required this.title,
     required this.status,
     required this.detail,
+    this.milestoneIndex,
+    this.approachTitle,
   });
 
   final String id;
   final String title;
   final String status;
   final String detail;
+  final int? milestoneIndex;
+  final String? approachTitle;
 
-  _ActionStep copyWith({String? status, String? detail}) {
+  _ActionStep copyWith({
+    String? status,
+    String? detail,
+    int? milestoneIndex,
+    String? approachTitle,
+  }) {
     return _ActionStep(
       id: id,
       title: title,
       status: status ?? this.status,
       detail: detail ?? this.detail,
+      milestoneIndex: milestoneIndex ?? this.milestoneIndex,
+      approachTitle: approachTitle ?? this.approachTitle,
     );
   }
 }
+
+class _ApproachProgressItem {
+  const _ApproachProgressItem({
+    required this.title,
+    required this.status,
+    this.detail = '',
+  });
+
+  final String title;
+  final String status;
+  final String detail;
+
+  _ApproachProgressItem copyWith({
+    String? title,
+    String? status,
+    String? detail,
+  }) {
+    return _ApproachProgressItem(
+      title: title ?? this.title,
+      status: status ?? this.status,
+      detail: detail ?? this.detail,
+    );
+  }
+}
+
+class _MilestoneProgressItem {
+  const _MilestoneProgressItem({
+    required this.title,
+    required this.status,
+    required this.approaches,
+    this.detail = '',
+  });
+
+  final String title;
+  final String status;
+  final String detail;
+  final List<_ApproachProgressItem> approaches;
+
+  _MilestoneProgressItem copyWith({
+    String? title,
+    String? status,
+    String? detail,
+    List<_ApproachProgressItem>? approaches,
+  }) {
+    return _MilestoneProgressItem(
+      title: title ?? this.title,
+      status: status ?? this.status,
+      detail: detail ?? this.detail,
+      approaches: approaches ?? this.approaches,
+    );
+  }
+}
+
+class _LocalCompletionResult {
+  const _LocalCompletionResult._({
+    required this.state,
+    required this.reason,
+  });
+
+  const _LocalCompletionResult.complete(String reason)
+      : this._(state: _LocalCompletionState.complete, reason: reason);
+
+  const _LocalCompletionResult.incomplete(String reason)
+      : this._(state: _LocalCompletionState.incomplete, reason: reason);
+
+  const _LocalCompletionResult.ambiguous(String reason)
+      : this._(state: _LocalCompletionState.ambiguous, reason: reason);
+
+  final _LocalCompletionState state;
+  final String reason;
+
+  bool get isComplete => state == _LocalCompletionState.complete;
+  bool get isAmbiguous => state == _LocalCompletionState.ambiguous;
+
+  String get label => switch (state) {
+    _LocalCompletionState.complete => 'complete',
+    _LocalCompletionState.incomplete => 'incomplete',
+    _LocalCompletionState.ambiguous => 'ambiguous',
+  };
+}
+
+enum _LocalCompletionState { complete, incomplete, ambiguous }
 
 class _CapturedScreenshot {
   const _CapturedScreenshot({
@@ -1306,57 +1915,606 @@ class _TaskBubbleWithActions extends StatelessWidget {
   }
 }
 
-class _StrategyBadge extends StatelessWidget {
-  const _StrategyBadge({required this.strategy});
+class _SectionCard extends StatelessWidget {
+  const _SectionCard({
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.child,
+  });
 
-  final StrategyResult strategy;
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final Widget child;
 
   @override
   Widget build(BuildContext context) {
-    final isCached = strategy.source == 'cache';
-    final icon = isCached ? Icons.cached : Icons.auto_awesome_outlined;
-    final label = isCached ? 'Cached strategy' : 'New strategy';
-    final pattern = strategy.taskPattern;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF252C35),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFF39424E)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 28,
+                height: 28,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF303845),
+                  borderRadius: BorderRadius.circular(9),
+                ),
+                child: Icon(icon, size: 16, color: const Color(0xFFD2D8DF)),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Color(0xFFE8E9EB),
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: Color(0xFF8A95A5),
+                        fontSize: 11.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          child,
+        ],
+      ),
+    );
+  }
+}
+
+class _SummaryCard extends StatelessWidget {
+  const _SummaryCard({
+    required this.task,
+    required this.totalMilestones,
+    required this.completedMilestones,
+    required this.isRunning,
+    required this.isPlanning,
+    required this.abortReason,
+    required this.totalSteps,
+  });
+
+  final String? task;
+  final int totalMilestones;
+  final int completedMilestones;
+  final bool isRunning;
+  final bool isPlanning;
+  final String? abortReason;
+  final int totalSteps;
+
+  @override
+  Widget build(BuildContext context) {
+    final statusLabel = abortReason != null
+        ? 'Needs attention'
+        : isRunning
+        ? (isPlanning ? 'Planning' : 'Executing')
+        : completedMilestones > 0 && completedMilestones == totalMilestones
+        ? 'Completed'
+        : 'Ready';
+    final statusColor = abortReason != null
+        ? const Color(0xFFE57373)
+        : isRunning
+        ? const Color(0xFF64B5F6)
+        : completedMilestones > 0 && completedMilestones == totalMilestones
+        ? const Color(0xFF81C784)
+        : const Color(0xFFB8C1CC);
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: const Color(0xFF2A3441),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(
-          color: isCached
-              ? const Color(0xFF4E886B)
-              : const Color(0xFF4E6288),
+        gradient: const LinearGradient(
+          colors: [Color(0xFF2A313C), Color(0xFF222831)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
         ),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF3C4552)),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(
-            icon,
-            size: 14,
-            color: isCached
-                ? const Color(0xFF81C784)
-                : const Color(0xFF90CAF9),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              '$label: "$pattern"',
-              style: TextStyle(
-                color: isCached
-                    ? const Color(0xFF81C784)
-                    : const Color(0xFF90CAF9),
-                fontSize: 11.5,
-                fontWeight: FontWeight.w500,
+          Row(
+            children: [
+              const Icon(
+                Icons.auto_awesome_outlined,
+                size: 16,
+                color: Color(0xFFE8E9EB),
               ),
-              maxLines: 1,
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Take Action workspace',
+                  style: TextStyle(
+                    color: Color(0xFFE8E9EB),
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              _StatusPill(label: statusLabel, color: statusColor),
+            ],
+          ),
+          if (task != null && task!.trim().isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Text(
+              task!,
+              maxLines: 2,
               overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Color(0xFFB8C1CC),
+                fontSize: 12.5,
+                height: 1.35,
+              ),
             ),
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _MetricChip(
+                label: 'Milestones',
+                value: totalMilestones == 0
+                    ? 'Pending'
+                    : '$completedMilestones/$totalMilestones',
+              ),
+              _MetricChip(label: 'Tracked steps', value: '$totalSteps'),
+              _MetricChip(
+                label: 'Phase',
+                value: isPlanning
+                    ? 'Planning'
+                    : (isRunning ? 'Executing' : 'Idle'),
+              ),
+            ],
           ),
         ],
       ),
     );
+  }
+}
+
+class _MilestoneProgressBoard extends StatelessWidget {
+  const _MilestoneProgressBoard({
+    required this.milestones,
+    required this.activeMilestoneIndex,
+    required this.activeApproachIndex,
+  });
+
+  final List<_MilestoneProgressItem> milestones;
+  final int activeMilestoneIndex;
+  final int activeApproachIndex;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        for (var i = 0; i < milestones.length; i++) ...[
+          _MilestoneProgressTile(
+            item: milestones[i],
+            index: i,
+            isActive: i == activeMilestoneIndex,
+            activeApproachIndex: i == activeMilestoneIndex
+                ? activeApproachIndex
+                : -1,
+          ),
+          if (i != milestones.length - 1) const SizedBox(height: 10),
+        ],
+      ],
+    );
+  }
+}
+
+class _MilestoneProgressTile extends StatelessWidget {
+  const _MilestoneProgressTile({
+    required this.item,
+    required this.index,
+    required this.isActive,
+    required this.activeApproachIndex,
+  });
+
+  final _MilestoneProgressItem item;
+  final int index;
+  final bool isActive;
+  final int activeApproachIndex;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = _statusColor(item.status);
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: isActive ? const Color(0xFF2C3541) : const Color(0xFF20262E),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isActive ? accent : const Color(0xFF323A45),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 24,
+                height: 24,
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.16),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  '${index + 1}',
+                  style: TextStyle(
+                    color: accent,
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  item.title,
+                  style: const TextStyle(
+                    color: Color(0xFFE8E9EB),
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              _StatusPill(
+                label: _statusLabel(item.status),
+                color: accent,
+              ),
+            ],
+          ),
+          if (item.detail.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              item.detail,
+              style: const TextStyle(
+                color: Color(0xFF8A95A5),
+                fontSize: 11.5,
+              ),
+            ),
+          ],
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              for (var i = 0; i < item.approaches.length; i++)
+                _ApproachChip(
+                  approach: item.approaches[i],
+                  isActive: isActive && i == activeApproachIndex,
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ApproachChip extends StatelessWidget {
+  const _ApproachChip({
+    required this.approach,
+    required this.isActive,
+  });
+
+  final _ApproachProgressItem approach;
+  final bool isActive;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _statusColor(approach.status);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: isActive
+            ? color.withValues(alpha: 0.14)
+            : const Color(0xFF262D36),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: isActive ? color : const Color(0xFF39424E),
+        ),
+      ),
+      child: Text(
+        approach.title,
+        style: TextStyle(
+          color: isActive ? color : const Color(0xFFB8C1CC),
+          fontSize: 11.5,
+          fontWeight: isActive ? FontWeight.w600 : FontWeight.w500,
+        ),
+      ),
+    );
+  }
+}
+
+class _ActiveMilestoneCard extends StatelessWidget {
+  const _ActiveMilestoneCard({
+    required this.milestoneTitle,
+    required this.milestoneIndex,
+    required this.totalMilestones,
+    required this.milestoneStatus,
+    required this.milestoneDetail,
+    required this.approachTitle,
+    required this.approachStatus,
+    required this.approachDetail,
+    required this.completionLabel,
+    required this.completionReason,
+    required this.isPlanning,
+  });
+
+  final String milestoneTitle;
+  final int milestoneIndex;
+  final int totalMilestones;
+  final String milestoneStatus;
+  final String milestoneDetail;
+  final String approachTitle;
+  final String approachStatus;
+  final String approachDetail;
+  final String completionLabel;
+  final String completionReason;
+  final bool isPlanning;
+
+  @override
+  Widget build(BuildContext context) {
+    final milestoneColor = _statusColor(milestoneStatus);
+    final approachColor = _statusColor(approachStatus);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Milestone ${milestoneIndex + 1}${totalMilestones > 0 ? ' of $totalMilestones' : ''}',
+                style: const TextStyle(
+                  color: Color(0xFF8A95A5),
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            _StatusPill(
+              label: _statusLabel(milestoneStatus),
+              color: milestoneColor,
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          milestoneTitle,
+          style: const TextStyle(
+            color: Color(0xFFE8E9EB),
+            fontSize: 14,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        if (milestoneDetail.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Text(
+            milestoneDetail,
+            style: const TextStyle(
+              color: Color(0xFFB8C1CC),
+              fontSize: 12,
+              height: 1.35,
+            ),
+          ),
+        ],
+        const SizedBox(height: 12),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF20262E),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFF323A45)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Selected approach',
+                      style: TextStyle(
+                        color: Color(0xFF8A95A5),
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  _StatusPill(
+                    label: _statusLabel(approachStatus),
+                    color: approachColor,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text(
+                approachTitle,
+                style: const TextStyle(
+                  color: Color(0xFFE8E9EB),
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              if (approachDetail.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(
+                  approachDetail,
+                  style: const TextStyle(
+                    color: Color(0xFFB8C1CC),
+                    fontSize: 11.5,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _MetricChip(
+              label: 'Completion signal',
+              value: completionLabel.isEmpty ? 'Pending' : completionLabel,
+            ),
+            _MetricChip(
+              label: 'Mode',
+              value: isPlanning ? 'Planning next steps' : 'Execution live',
+            ),
+          ],
+        ),
+        if (completionReason.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: const Color(0xFF20262E),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF323A45)),
+            ),
+            child: Text(
+              completionReason,
+              style: const TextStyle(
+                color: Color(0xFFB8C1CC),
+                fontSize: 11.5,
+                height: 1.35,
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _MetricChip extends StatelessWidget {
+  const _MetricChip({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF20262E),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF323A45)),
+      ),
+      child: RichText(
+        text: TextSpan(
+          style: const TextStyle(fontFamily: 'inherit'),
+          children: [
+            TextSpan(
+              text: '$label  ',
+              style: const TextStyle(
+                color: Color(0xFF8A95A5),
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            TextSpan(
+              text: value,
+              style: const TextStyle(
+                color: Color(0xFFE8E9EB),
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({required this.label, required this.color});
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color,
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+Color _statusColor(String status) {
+  switch (status) {
+    case 'completed':
+      return const Color(0xFF81C784);
+    case 'active':
+    case 'started':
+      return const Color(0xFF64B5F6);
+    case 'failed':
+      return const Color(0xFFE57373);
+    default:
+      return const Color(0xFFB8C1CC);
+  }
+}
+
+String _statusLabel(String status) {
+  switch (status) {
+    case 'completed':
+      return 'Completed';
+    case 'active':
+      return 'Active';
+    case 'started':
+      return 'Running';
+    case 'failed':
+      return 'Failed';
+    default:
+      return 'Pending';
   }
 }
 
@@ -1530,6 +2688,83 @@ class _EditTaskModeBanner extends StatelessWidget {
             icon: const Icon(Icons.close),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _MilestoneStepGroup extends StatelessWidget {
+  const _MilestoneStepGroup({
+    required this.title,
+    required this.subtitle,
+    required this.steps,
+    required this.isActive,
+  });
+
+  final String title;
+  final String subtitle;
+  final List<_ActionStep> steps;
+  final bool isActive;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      duration: const Duration(milliseconds: 180),
+      opacity: isActive ? 1 : 0.72,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: isActive ? const Color(0xFF20262E) : const Color(0xFF1C2128),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isActive
+                ? const Color(0xFF3F4A58)
+                : const Color(0xFF2C333D),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(
+                      color: Color(0xFFE8E9EB),
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                _StatusPill(
+                  label: isActive ? 'Active' : 'History',
+                  color: isActive
+                      ? const Color(0xFF64B5F6)
+                      : const Color(0xFF8A95A5),
+                ),
+              ],
+            ),
+            if (subtitle.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                subtitle,
+                style: const TextStyle(
+                  color: Color(0xFF8A95A5),
+                  fontSize: 11.5,
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            for (var i = 0; i < steps.length; i++)
+              _StepTimelineRow(
+                step: steps[i],
+                isFirst: i == 0,
+                isLast: i == steps.length - 1,
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1908,44 +3143,71 @@ class _PlannerTraceTile extends StatelessWidget {
   }
 }
 
-class _TraceSection extends StatelessWidget {
+class _TraceSection extends StatefulWidget {
   const _TraceSection({required this.label, required this.content});
 
   final String label;
   final String content;
 
   @override
+  State<_TraceSection> createState() => _TraceSectionState();
+}
+
+class _TraceSectionState extends State<_TraceSection> {
+  bool _expanded = false;
+
+  @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          label,
-          style: const TextStyle(
-            color: Color(0xFF8A95A5),
-            fontSize: 10.5,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        const SizedBox(height: 3),
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            color: const Color(0xFF1D222A),
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1D222A),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
             borderRadius: BorderRadius.circular(5),
-          ),
-          child: Text(
-            content.isEmpty ? '[empty]' : content,
-            style: const TextStyle(
-              color: Color(0xFF9EA5AF),
-              fontSize: 10.5,
-              fontFamily: 'monospace',
-              height: 1.35,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+              child: Row(
+                children: [
+                  Icon(
+                    _expanded ? Icons.expand_more : Icons.chevron_right,
+                    size: 14,
+                    color: const Color(0xFF8A95A5),
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      widget.label,
+                      style: const TextStyle(
+                        color: Color(0xFF8A95A5),
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-        ),
-      ],
+          if (_expanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+              child: Text(
+                widget.content.isEmpty ? '[empty]' : widget.content,
+                style: const TextStyle(
+                  color: Color(0xFF9EA5AF),
+                  fontSize: 10.5,
+                  fontFamily: 'monospace',
+                  height: 1.35,
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }

@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:arya_app/src/core/app_constants.dart';
+import 'package:arya_app/src/core/app_database.dart';
 import 'package:arya_app/src/features/file_vault/file_vault_entry.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -15,67 +15,8 @@ class FileVaultStore {
     if (_database != null) {
       return _database!;
     }
-
-    sqfliteFfiInit();
-    databaseFactory = databaseFactoryFfi;
-
-    final supportDir = await _resolveSupportDir();
-    final dbPath = p.join(supportDir.path, fileVaultDbName);
-    _database = await databaseFactory.openDatabase(
-      dbPath,
-      options: OpenDatabaseOptions(
-        version: 1,
-        onCreate: (db, version) async {
-          await db.execute('''
-            CREATE TABLE file_vault_entries (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              path TEXT NOT NULL UNIQUE,
-              name TEXT NOT NULL,
-              size_bytes INTEGER NOT NULL DEFAULT 0,
-              added_at INTEGER NOT NULL
-            )
-          ''');
-        },
-      ),
-    );
+    _database = await AppDatabase.instance.open();
     return _database!;
-  }
-
-  Future<Directory> _resolveSupportDir() async {
-    String basePath;
-
-    if (Platform.isMacOS) {
-      final home = Platform.environment['HOME'];
-      basePath = home == null
-          ? Directory.current.path
-          : p.join(home, 'Library', 'Application Support');
-    } else if (Platform.isLinux) {
-      final xdgData = Platform.environment['XDG_DATA_HOME'];
-      if (xdgData != null && xdgData.isNotEmpty) {
-        basePath = xdgData;
-      } else {
-        final home = Platform.environment['HOME'];
-        basePath = home == null
-            ? Directory.current.path
-            : p.join(home, '.local', 'share');
-      }
-    } else if (Platform.isWindows) {
-      final appData = Platform.environment['APPDATA'];
-      final localAppData = Platform.environment['LOCALAPPDATA'];
-      basePath = (appData != null && appData.isNotEmpty)
-          ? appData
-          : ((localAppData != null && localAppData.isNotEmpty)
-                ? localAppData
-                : Directory.current.path);
-    } else {
-      basePath = Directory.current.path;
-    }
-
-    final dir = Directory(p.join(basePath, 'Arya'));
-    if (!await dir.exists()) {
-      await dir.create(recursive: true);
-    }
-    return dir;
   }
 
   Future<List<FileVaultEntry>> listEntries() async {

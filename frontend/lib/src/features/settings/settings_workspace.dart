@@ -6,9 +6,6 @@ import 'package:arya_app/src/features/file_vault/file_vault_entry.dart';
 import 'package:arya_app/src/features/file_vault/file_vault_store.dart';
 import 'package:arya_app/src/features/settings/pages/ai_settings_page.dart';
 import 'package:arya_app/src/features/settings/pages/file_vault_settings_page.dart';
-import 'package:arya_app/src/features/settings/pages/general_settings_page.dart';
-import 'package:arya_app/src/features/settings/pages/password_vault_settings_page.dart';
-import 'package:arya_app/src/features/settings/pages/payment_vault_settings_page.dart';
 import 'package:arya_app/src/features/settings/settings_tab.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -22,7 +19,7 @@ class SettingsWorkspace extends StatefulWidget {
 }
 
 class _SettingsWorkspaceState extends State<SettingsWorkspace> {
-  SettingsTab _selectedTab = SettingsTab.general;
+  SettingsTab _selectedTab = SettingsTab.aiSettings;
   bool _isFileVaultLoading = false;
   bool _isAddingFiles = false;
   bool _hasLoadedFileVault = false;
@@ -233,8 +230,6 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
 
   Widget _settingsTabBody() {
     switch (_selectedTab) {
-      case SettingsTab.general:
-        return const GeneralSettingsPage();
       case SettingsTab.aiSettings:
         return const AiSettingsPage();
       case SettingsTab.fileVault:
@@ -247,10 +242,6 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
           formatBytes: _formatBytes,
           formatAddedAt: _formatAddedAt,
         );
-      case SettingsTab.passwordVault:
-        return const PasswordVaultSettingsPage();
-      case SettingsTab.paymentVault:
-        return const PaymentVaultSettingsPage();
     }
   }
 
@@ -340,15 +331,18 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                 children: [
                   Row(
                     children: [
-                      Text(
-                        _selectedTab.label,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 20,
-                          fontWeight: FontWeight.w700,
+                      Expanded(
+                        child: Text(
+                          _selectedTab.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 20,
+                            fontWeight: FontWeight.w700,
+                          ),
                         ),
                       ),
-                      const Spacer(),
                       if (_isFileVaultTab)
                         SizedBox(
                           height: 34,
@@ -377,30 +371,6 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                 : const Icon(Icons.add, size: 16),
                             label: const Text(
                               'Add',
-                              style: TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        )
-                      else if (_selectedTab != SettingsTab.aiSettings)
-                        SizedBox(
-                          height: 34,
-                          width: 78,
-                          child: ElevatedButton(
-                            onPressed: () {},
-                            style: ElevatedButton.styleFrom(
-                              elevation: 0,
-                              padding: EdgeInsets.zero,
-                              backgroundColor: const Color(0xFF1F80E9),
-                              foregroundColor: Colors.white,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                            ),
-                            child: const Text(
-                              'Save',
                               style: TextStyle(
                                 fontSize: 13,
                                 fontWeight: FontWeight.w600,
