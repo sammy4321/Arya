@@ -21,6 +21,7 @@ class ChatView extends StatefulWidget {
     required this.isLoading,
     required this.onSendMessage,
     required this.onEditUserMessage,
+    required this.onStopGenerating,
     super.key,
   });
 
@@ -28,6 +29,7 @@ class ChatView extends StatefulWidget {
   final bool isLoading;
   final ValueChanged<ChatMessage> onSendMessage;
   final Future<void> Function(int index, String newContent) onEditUserMessage;
+  final ChatMessage? Function() onStopGenerating;
 
   @override
   State<ChatView> createState() => _ChatViewState();
@@ -36,18 +38,61 @@ class ChatView extends StatefulWidget {
 class _ChatViewState extends State<ChatView> {
   final TextEditingController _controller = TextEditingController();
   final FocusNode _inputFocusNode = FocusNode();
+  final ScrollController _scrollController = ScrollController();
   final List<ChatAttachment> _pendingAttachments = [];
   final List<String> _loadingAttachmentNames = [];
   int? _editingMessageIndex;
   bool _isCapturingScreenshot = false;
   bool _isDragOver = false;
   bool _isAttachingFiles = false;
+  int _lastMessageCount = 0;
+  int _lastContentLength = 0;
+  int _lastReasoningLength = 0;
+  bool _lastWasStreaming = false;
 
   @override
   void dispose() {
     _controller.dispose();
     _inputFocusNode.dispose();
+    _scrollController.dispose();
     super.dispose();
+  }
+
+  void _maybeAutoScroll() {
+    final count = widget.messages.length;
+    if (count == 0) return;
+    final last = widget.messages.last;
+    final contentLen = last.content.length;
+    final reasoningLen = last.reasoning.length;
+    final isStreaming = last.isStreaming;
+    final changed = count != _lastMessageCount ||
+        contentLen != _lastContentLength ||
+        reasoningLen != _lastReasoningLength ||
+        isStreaming != _lastWasStreaming;
+    if (!changed) return;
+
+    _lastMessageCount = count;
+    _lastContentLength = contentLen;
+    _lastReasoningLength = reasoningLen;
+    _lastWasStreaming = isStreaming;
+
+    _scrollToBottom(immediate: isStreaming);
+  }
+
+  void _scrollToBottom({bool immediate = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final target = _scrollController.position.maxScrollExtent;
+      if (immediate) {
+        _scrollController.jumpTo(target);
+      } else {
+        _scrollController.animateTo(
+          target,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+        );
+      }
+    });
   }
 
   void _startEditingMessage(int index) {
@@ -347,12 +392,30 @@ class _ChatViewState extends State<ChatView> {
     setState(() => _pendingAttachments.clear());
   }
 
+  void _stopGenerationAndRestoreInput() {
+    final restored = widget.onStopGenerating();
+    if (restored == null) return;
+
+    setState(() {
+      _editingMessageIndex = null;
+      _pendingAttachments
+        ..clear()
+        ..addAll(restored.attachments);
+      _controller.value = TextEditingValue(
+        text: restored.content,
+        selection: TextSelection.collapsed(offset: restored.content.length),
+      );
+    });
+    _inputFocusNode.requestFocus();
+  }
+
   void _removeAttachment(int index) {
     setState(() => _pendingAttachments.removeAt(index));
   }
 
   @override
   Widget build(BuildContext context) {
+    _maybeAutoScroll();
     return DropTarget(
       onDragEntered: (_) => _setDragOver(true),
       onDragUpdated: (_) => _setDragOver(true),
@@ -378,6 +441,7 @@ class _ChatViewState extends State<ChatView> {
                   child: widget.messages.isEmpty
                       ? const _EmptyChatPlaceholder()
                       : ListView.builder(
+                          controller: _scrollController,
                           padding: const EdgeInsets.all(12),
                           itemCount: widget.messages.length,
                           itemBuilder: (context, index) {
@@ -413,9 +477,10 @@ class _ChatViewState extends State<ChatView> {
                 focusNode: _inputFocusNode,
                 attachments: _pendingAttachments,
                 loadingFileNames: _loadingAttachmentNames,
-                isLoading: widget.isLoading || _isAttachingFiles,
+                isLoading: widget.isLoading,
                 isCapturingScreenshot: _isCapturingScreenshot,
                 onSend: _sendMessage,
+                onStop: _stopGenerationAndRestoreInput,
                 onAttachmentRemove: _removeAttachment,
                 onPickFile: _pickFileFromComputer,
                 onScreenshot: _captureAndAttachScreenshot,

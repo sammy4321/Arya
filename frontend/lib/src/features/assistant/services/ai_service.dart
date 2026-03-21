@@ -56,6 +56,45 @@ class AiService {
     return (content: result.content, latencyMs: result.latencyMs);
   }
 
+  Stream<AiStreamChunk> streamChatMessage(List<ChatMessage> messages) async* {
+    final store = AiSettingsStore.instance;
+    final openRouterKey = await store.getApiKey();
+    final tavilyKey = await store.getTavilyApiKey();
+    final model = await store.getModel();
+
+    final configIssue = getOpenRouterConfigIssue(
+      apiKey: openRouterKey,
+      model: model,
+    );
+    if (configIssue == OpenRouterConfigIssue.missingModel) {
+      throw const AiException(
+        'Please select a model before sending a message.',
+      );
+    }
+    if (configIssue == OpenRouterConfigIssue.missingApiKey) {
+      throw const AiException(
+        'OpenRouter API key is missing. Set it in Settings.',
+      );
+    }
+
+    final formattedMessages = await Future.wait(
+      messages.map((m) => _formatMessage(m)),
+    );
+
+    await for (final chunk in _orchestrator.respondStream(
+      openRouterKey: openRouterKey,
+      tavilyKey: tavilyKey,
+      model: model,
+      webMode: 'auto',
+      messages: formattedMessages,
+    )) {
+      yield AiStreamChunk(
+        contentDelta: chunk.contentDelta,
+        reasoningDelta: chunk.reasoningDelta,
+      );
+    }
+  }
+
   Future<Map<String, dynamic>> _formatMessage(ChatMessage message) async {
     if (message.attachments.isEmpty) {
       return {
@@ -148,4 +187,11 @@ class AiException implements Exception {
 
   @override
   String toString() => message;
+}
+
+class AiStreamChunk {
+  const AiStreamChunk({this.contentDelta = '', this.reasoningDelta = ''});
+
+  final String contentDelta;
+  final String reasoningDelta;
 }

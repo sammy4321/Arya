@@ -19,6 +19,7 @@ class ChatInput extends StatelessWidget {
     required this.onPickFile,
     required this.onScreenshot,
     required this.onPasteFiles,
+    required this.onStop,
     this.isCapturingScreenshot = false,
     super.key,
   });
@@ -34,6 +35,7 @@ class ChatInput extends StatelessWidget {
   final VoidCallback onPickFile;
   final VoidCallback onScreenshot;
   final ValueChanged<List<String>> onPasteFiles;
+  final VoidCallback onStop;
 
   Future<void> _handlePaste() async {
     final filePaths = await ClipboardFileService.instance
@@ -137,6 +139,32 @@ class ChatInput extends StatelessWidget {
     return existing;
   }
 
+  KeyEventResult _handleInputKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    final isEnter =
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter;
+    if (!isEnter) return KeyEventResult.ignored;
+
+    final keyboard = HardwareKeyboard.instance;
+    final hasModifier =
+        keyboard.isShiftPressed ||
+        keyboard.isControlPressed ||
+        keyboard.isAltPressed ||
+        keyboard.isMetaPressed;
+
+    if (hasModifier) {
+      // Allow Shift+Enter (and other modified Enter shortcuts) to pass through.
+      return KeyEventResult.ignored;
+    }
+
+    if (!isLoading) {
+      onSend();
+    }
+    return KeyEventResult.handled;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -209,38 +237,40 @@ class ChatInput extends StatelessWidget {
                       ),
                       // TextField
                       Expanded(
-                        child: Actions(
-                          actions: <Type, Action<Intent>>{
-                            PasteTextIntent: CallbackAction<PasteTextIntent>(
-                              onInvoke: (_) {
-                                _handlePaste();
-                                return null;
-                              },
-                            ),
-                          },
-                          child: TextField(
-                            controller: controller,
-                            focusNode: focusNode,
-                            style: const TextStyle(
-                              color: Color(0xFFE8E9EB),
-                              fontSize: 14,
-                            ),
-                            maxLines: 5,
-                            minLines: 1,
-                            textInputAction: TextInputAction.send,
-                            onSubmitted: (_) => isLoading ? null : onSend(),
-                            decoration: const InputDecoration(
-                              hintText: 'Ask me anything...',
-                              hintStyle: TextStyle(
-                                color: Color(0xFF9EA5AF),
+                        child: Focus(
+                          onKeyEvent: (_, event) => _handleInputKeyEvent(event),
+                          child: Actions(
+                            actions: <Type, Action<Intent>>{
+                              PasteTextIntent: CallbackAction<PasteTextIntent>(
+                                onInvoke: (_) {
+                                  _handlePaste();
+                                  return null;
+                                },
+                              ),
+                            },
+                            child: TextField(
+                              controller: controller,
+                              focusNode: focusNode,
+                              style: const TextStyle(
+                                color: Color(0xFFE8E9EB),
                                 fontSize: 14,
                               ),
-                              border: InputBorder.none,
-                              contentPadding: EdgeInsets.symmetric(
-                                horizontal: 12,
-                                vertical: 12,
+                              maxLines: 5,
+                              minLines: 1,
+                              textInputAction: TextInputAction.newline,
+                              decoration: const InputDecoration(
+                                hintText: 'Ask me anything...',
+                                hintStyle: TextStyle(
+                                  color: Color(0xFF9EA5AF),
+                                  fontSize: 14,
+                                ),
+                                border: InputBorder.none,
+                                contentPadding: EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 12,
+                                ),
+                                isCollapsed: true,
                               ),
-                              isCollapsed: true,
                             ),
                           ),
                         ),
@@ -253,7 +283,7 @@ class ChatInput extends StatelessWidget {
           ),
           const SizedBox(width: 8),
           // Submit/Send icon
-          _SendButton(isLoading: isLoading, onTap: onSend),
+          _SendButton(isLoading: isLoading, onTap: onSend, onStop: onStop),
         ],
       ),
     );
@@ -261,39 +291,74 @@ class ChatInput extends StatelessWidget {
 }
 
 class _SendButton extends StatelessWidget {
-  const _SendButton({required this.isLoading, required this.onTap});
+  const _SendButton({
+    required this.isLoading,
+    required this.onTap,
+    required this.onStop,
+  });
 
   final bool isLoading;
   final VoidCallback onTap;
+  final VoidCallback onStop;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: 36,
-      height: 36,
-      decoration: BoxDecoration(
-        color: isLoading ? const Color(0xFF677281) : const Color(0xFF1F80E9),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: InkWell(
-        onTap: isLoading ? null : onTap,
-        borderRadius: BorderRadius.circular(12),
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            if (!isLoading)
-              const Icon(Icons.send, color: Colors.white, size: 18),
-            if (isLoading)
-              const SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: Colors.white,
+    return Tooltip(
+      message: isLoading ? 'Stop generating' : 'Send message',
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 160),
+        switchInCurve: Curves.easeOut,
+        switchOutCurve: Curves.easeIn,
+        child: isLoading
+            ? InkWell(
+                key: const ValueKey('loading_stop_button'),
+                onTap: onStop,
+                borderRadius: BorderRadius.circular(20),
+                child: SizedBox(
+                  width: 38,
+                  height: 38,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      const SizedBox(
+                        width: 38,
+                        height: 38,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.2,
+                          color: Color(0xFF9CC8FF),
+                        ),
+                      ),
+                      Container(
+                        width: 30,
+                        height: 30,
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Color(0xFF5F6C7B),
+                        ),
+                        child: const Icon(
+                          Icons.stop_rounded,
+                          color: Colors.white,
+                          size: 16,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            : InkWell(
+                key: const ValueKey('idle_send_button'),
+                onTap: onTap,
+                borderRadius: BorderRadius.circular(12),
+                child: Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1F80E9),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Icon(Icons.send, color: Colors.white, size: 18),
                 ),
               ),
-          ],
-        ),
       ),
     );
   }

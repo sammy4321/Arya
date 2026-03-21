@@ -35,6 +35,12 @@ class ChatOrchestrator {
       queryText: latestUserText,
       autoHints: chatAutoWebHints,
     );
+    // Helpful runtime visibility when diagnosing whether web context is used.
+    // ignore: avoid_print
+    print(
+      '[ChatOrchestrator] shouldSearch=$shouldSearch '
+      'query="${latestUserText.length > 80 ? '${latestUserText.substring(0, 80)}...' : latestUserText}"',
+    );
 
     var enrichedMessages = List<Map<String, dynamic>>.of(messages);
     if (shouldSearch && latestUserText.isNotEmpty) {
@@ -43,6 +49,8 @@ class ChatOrchestrator {
         query: latestUserText,
         maxResults: 5,
       );
+      // ignore: avoid_print
+      print('[ChatOrchestrator] webResults=${webResults.length}');
       if (webResults.isNotEmpty) {
         usedWeb = true;
         sources = webResults.where((r) => r.url.isNotEmpty).toList();
@@ -63,6 +71,54 @@ class ChatOrchestrator {
       usedWebSearch: usedWeb,
       sources: sources,
     );
+  }
+
+  Stream<ChatOrchestratorStreamChunk> respondStream({
+    required String openRouterKey,
+    required String tavilyKey,
+    required String model,
+    required String webMode,
+    required List<Map<String, dynamic>> messages,
+  }) async* {
+    validateOpenRouterConfig(apiKey: openRouterKey, model: model);
+
+    final latestUserText = _extractLatestUserText(messages);
+    final shouldSearch = shouldRunWebSearch(
+      mode: webMode,
+      tavilyKey: tavilyKey,
+      queryText: latestUserText,
+      autoHints: chatAutoWebHints,
+    );
+    // ignore: avoid_print
+    print(
+      '[ChatOrchestrator/stream] shouldSearch=$shouldSearch '
+      'query="${latestUserText.length > 80 ? '${latestUserText.substring(0, 80)}...' : latestUserText}"',
+    );
+
+    var enrichedMessages = List<Map<String, dynamic>>.of(messages);
+    if (shouldSearch && latestUserText.isNotEmpty) {
+      final webResults = await _tavily.search(
+        apiKey: tavilyKey,
+        query: latestUserText,
+        maxResults: 5,
+      );
+      // ignore: avoid_print
+      print('[ChatOrchestrator/stream] webResults=${webResults.length}');
+      if (webResults.isNotEmpty) {
+        enrichedMessages = _injectWebContext(messages, webResults);
+      }
+    }
+
+    await for (final chunk in _openRouter.chatCompletionStream(
+      apiKey: openRouterKey,
+      model: model,
+      messages: enrichedMessages,
+    )) {
+      yield ChatOrchestratorStreamChunk(
+        contentDelta: chunk.contentDelta,
+        reasoningDelta: chunk.reasoningDelta,
+      );
+    }
   }
 
   static String _extractLatestUserText(List<Map<String, dynamic>> messages) {
@@ -93,7 +149,10 @@ class ChatOrchestrator {
       results: results,
       intro:
           'Web search results (most relevant first). '
-          'Use these as grounding for latest information and cite the URLs when useful.',
+          'You MUST ground your answer in these results for freshness-sensitive requests '
+          '(latest/current/news/today/version/price/recent). '
+          'Do not respond with generic advice only. '
+          'Include source citations as markdown links using the exact URLs from these results.',
     );
 
     return [
@@ -115,4 +174,14 @@ class ChatOrchestratorResult {
   final int latencyMs;
   final bool usedWebSearch;
   final List<TavilyResult> sources;
+}
+
+class ChatOrchestratorStreamChunk {
+  const ChatOrchestratorStreamChunk({
+    this.contentDelta = '',
+    this.reasoningDelta = '',
+  });
+
+  final String contentDelta;
+  final String reasoningDelta;
 }

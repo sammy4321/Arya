@@ -25,6 +25,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
   final List<ChatMessage> _chatMessages = [];
   bool _isLoading = false;
   int _takeActionResetKey = 0;
+  int _chatRequestEpoch = 0;
 
   // Predefined menu items for the home screen
   static const List<AssistantMenuItem> _assistantMenuItems = [
@@ -254,6 +255,7 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
           isLoading: _isLoading,
           onSendMessage: _handleUserMessage,
           onEditUserMessage: _handleEditUserMessage,
+          onStopGenerating: _stopCurrentChatRequest,
         );
       case AssistantView.takeAction:
         return TakeActionView(key: ValueKey(_takeActionResetKey));
@@ -341,18 +343,53 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
       if (_currentView == AssistantView.takeAction) {
         _takeActionResetKey++;
       } else {
+        _chatRequestEpoch++;
         _chatMessages.clear();
+        _isLoading = false;
       }
     });
   }
 
   Future<void> _handleUserMessage(ChatMessage userMessage) async {
+    final requestEpoch = ++_chatRequestEpoch;
+    final placeholder = ChatMessage(
+      content: '',
+      isUser: false,
+      isStreaming: true,
+    );
     setState(() {
       _chatMessages.add(userMessage);
+      _chatMessages.add(placeholder);
       _isLoading = true;
     });
 
-    await _requestAssistantReply();
+    final requestMessages = _chatMessages
+        .where((m) => !m.isStreaming)
+        .toList(growable: false);
+    await _streamAssistantReply(
+      requestEpoch: requestEpoch,
+      assistantIndex: _chatMessages.length - 1,
+      requestMessages: requestMessages,
+    );
+  }
+
+  ChatMessage? _stopCurrentChatRequest() {
+    if (!_isLoading) return null;
+
+    ChatMessage? restored;
+    setState(() {
+      _chatRequestEpoch++;
+      _isLoading = false;
+      if (_chatMessages.isNotEmpty &&
+          !_chatMessages.last.isUser &&
+          _chatMessages.last.isStreaming) {
+        _chatMessages.removeLast();
+      }
+      if (_chatMessages.isNotEmpty && _chatMessages.last.isUser) {
+        restored = _chatMessages.removeLast();
+      }
+    });
+    return restored;
   }
 
   Future<void> _handleEditUserMessage(int index, String newContent) async {
@@ -367,43 +404,90 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
       isUser: true,
       attachments: original.attachments,
     );
+    final placeholder = ChatMessage(
+      content: '',
+      isUser: false,
+      isStreaming: true,
+    );
     final truncated = <ChatMessage>[..._chatMessages.take(index), edited];
 
     setState(() {
       _chatMessages
         ..clear()
-        ..addAll(truncated);
+        ..addAll(truncated)
+        ..add(placeholder);
       _isLoading = true;
     });
 
-    await _requestAssistantReply();
+    final requestEpoch = ++_chatRequestEpoch;
+    final requestMessages = _chatMessages
+        .where((m) => !m.isStreaming)
+        .toList(growable: false);
+    await _streamAssistantReply(
+      requestEpoch: requestEpoch,
+      assistantIndex: _chatMessages.length - 1,
+      requestMessages: requestMessages,
+    );
   }
 
-  Future<void> _requestAssistantReply() async {
+  Future<void> _streamAssistantReply({
+    required int requestEpoch,
+    required int assistantIndex,
+    required List<ChatMessage> requestMessages,
+  }) async {
+    final stopwatch = Stopwatch()..start();
     try {
-      final result = await AiService.instance.sendChatMessage(_chatMessages);
+      await for (final chunk in AiService.instance.streamChatMessage(
+        requestMessages,
+      )) {
+        if (!mounted || requestEpoch != _chatRequestEpoch) return;
+        if (chunk.contentDelta.isEmpty && chunk.reasoningDelta.isEmpty) {
+          continue;
+        }
 
-      if (!mounted) return;
-
+        setState(() {
+          if (assistantIndex < 0 || assistantIndex >= _chatMessages.length) {
+            return;
+          }
+          final current = _chatMessages[assistantIndex];
+          _chatMessages[assistantIndex] = current.copyWith(
+            content: '${current.content}${chunk.contentDelta}',
+            reasoning: '${current.reasoning}${chunk.reasoningDelta}',
+          );
+        });
+      }
+      if (!mounted || requestEpoch != _chatRequestEpoch) return;
+      stopwatch.stop();
       setState(() {
-        _chatMessages.add(
-          ChatMessage(
-            content: result.content,
-            isUser: false,
-            latencyMs: result.latencyMs,
-          ),
-        );
+        if (assistantIndex >= 0 && assistantIndex < _chatMessages.length) {
+          final current = _chatMessages[assistantIndex];
+          final hasOutput =
+              current.content.trim().isNotEmpty ||
+              current.reasoning.trim().isNotEmpty;
+          _chatMessages[assistantIndex] = current.copyWith(
+            content: hasOutput ? current.content : 'No response from AI',
+            isStreaming: false,
+            latencyMs: stopwatch.elapsedMilliseconds,
+          );
+        }
         _isLoading = false;
       });
     } on AiException catch (e) {
-      if (!mounted) return;
+      if (!mounted || requestEpoch != _chatRequestEpoch) return;
 
       setState(() {
-        _chatMessages.add(ChatMessage(content: e.message, isUser: false));
+        if (assistantIndex >= 0 && assistantIndex < _chatMessages.length) {
+          _chatMessages[assistantIndex] = ChatMessage(
+            content: e.message,
+            isUser: false,
+          );
+        } else {
+          _chatMessages.add(ChatMessage(content: e.message, isUser: false));
+        }
         _isLoading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || requestEpoch != _chatRequestEpoch) return;
 
       String errorMessage;
       if (e.toString().contains('timeout') ||
@@ -414,7 +498,14 @@ class _FloatingButtonScreenState extends State<FloatingButtonScreen> {
       }
 
       setState(() {
-        _chatMessages.add(ChatMessage(content: errorMessage, isUser: false));
+        if (assistantIndex >= 0 && assistantIndex < _chatMessages.length) {
+          _chatMessages[assistantIndex] = ChatMessage(
+            content: errorMessage,
+            isUser: false,
+          );
+        } else {
+          _chatMessages.add(ChatMessage(content: errorMessage, isUser: false));
+        }
         _isLoading = false;
       });
     }
