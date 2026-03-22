@@ -134,3 +134,42 @@ Future<Map<String, dynamic>?> getCurrentWindowDisplayRegion() async {
     return null;
   }
 }
+
+Future<bool> isPointObscuredByAssistantWindow(Offset point) async {
+  if (!supportsDesktopWindowControls) {
+    return false;
+  }
+  try {
+    final windowPosition = await windowManager.getPosition();
+    final windowSize = await windowManager.getSize();
+    final windowRect = Rect.fromLTWH(
+      windowPosition.dx,
+      windowPosition.dy,
+      windowSize.width,
+      windowSize.height,
+    );
+    return windowRect.contains(point);
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<T> withAssistantWindowHiddenIfObscuringPoint<T>({
+  required Offset point,
+  required Future<T> Function() action,
+  Duration hideDelay = const Duration(milliseconds: 180),
+  Duration restoreDelay = const Duration(milliseconds: 120),
+}) async {
+  if (!await isPointObscuredByAssistantWindow(point)) {
+    return action();
+  }
+
+  await windowManager.hide();
+  await Future<void>.delayed(hideDelay);
+  try {
+    return await action();
+  } finally {
+    await windowManager.show();
+    await Future<void>.delayed(restoreDelay);
+  }
+}

@@ -1,5 +1,6 @@
-import 'package:arya_app/src/features/assistant/services/ai_validation.dart';
+import 'package:arya_app/src/features/assistant/models/ai_provider.dart';
 import 'package:arya_app/src/features/assistant/services/openrouter_client.dart';
+import 'package:arya_app/src/features/assistant/services/ollama_client.dart';
 import 'package:arya_app/src/features/assistant/services/tavily_client.dart';
 import 'package:arya_app/src/features/assistant/services/web_context_helper.dart';
 
@@ -8,22 +9,25 @@ import 'package:arya_app/src/features/assistant/services/web_context_helper.dart
 class ChatOrchestrator {
   ChatOrchestrator({
     OpenRouterClient? openRouterClient,
+    OllamaClient? ollamaClient,
     TavilyClient? tavilyClient,
   }) : _openRouter = openRouterClient ?? OpenRouterClient(),
+       _ollama = ollamaClient ?? OllamaClient(),
        _tavily = tavilyClient ?? TavilyClient();
 
   final OpenRouterClient _openRouter;
+  final OllamaClient _ollama;
   final TavilyClient _tavily;
 
   Future<ChatOrchestratorResult> respond({
+    required AiProvider provider,
     required String openRouterKey,
+    required String ollamaBaseUrl,
     required String tavilyKey,
     required String model,
     required String webMode,
     required List<Map<String, dynamic>> messages,
   }) async {
-    validateOpenRouterConfig(apiKey: openRouterKey, model: model);
-
     final stopwatch = Stopwatch()..start();
     var sources = <TavilyResult>[];
     var usedWeb = false;
@@ -58,11 +62,18 @@ class ChatOrchestrator {
       }
     }
 
-    final content = await _openRouter.chatCompletion(
-      apiKey: openRouterKey,
-      model: model,
-      messages: enrichedMessages,
-    );
+    final content = switch (provider) {
+      AiProvider.openrouter => await _openRouter.chatCompletion(
+          apiKey: openRouterKey,
+          model: model,
+          messages: enrichedMessages,
+        ),
+      AiProvider.ollama => await _ollama.chatCompletion(
+          baseUrl: ollamaBaseUrl,
+          model: model,
+          messages: enrichedMessages,
+        ),
+    };
     stopwatch.stop();
 
     return ChatOrchestratorResult(
@@ -74,14 +85,14 @@ class ChatOrchestrator {
   }
 
   Stream<ChatOrchestratorStreamChunk> respondStream({
+    required AiProvider provider,
     required String openRouterKey,
+    required String ollamaBaseUrl,
     required String tavilyKey,
     required String model,
     required String webMode,
     required List<Map<String, dynamic>> messages,
   }) async* {
-    validateOpenRouterConfig(apiKey: openRouterKey, model: model);
-
     final latestUserText = _extractLatestUserText(messages);
     final shouldSearch = shouldRunWebSearch(
       mode: webMode,
@@ -109,11 +120,19 @@ class ChatOrchestrator {
       }
     }
 
-    await for (final chunk in _openRouter.chatCompletionStream(
-      apiKey: openRouterKey,
-      model: model,
-      messages: enrichedMessages,
-    )) {
+    final stream = switch (provider) {
+      AiProvider.openrouter => _openRouter.chatCompletionStream(
+          apiKey: openRouterKey,
+          model: model,
+          messages: enrichedMessages,
+        ),
+      AiProvider.ollama => _ollama.chatCompletionStream(
+          baseUrl: ollamaBaseUrl,
+          model: model,
+          messages: enrichedMessages,
+        ),
+    };
+    await for (final chunk in stream) {
       yield ChatOrchestratorStreamChunk(
         contentDelta: chunk.contentDelta,
         reasoningDelta: chunk.reasoningDelta,

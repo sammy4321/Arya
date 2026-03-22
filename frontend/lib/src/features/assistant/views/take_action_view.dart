@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:arya_app/src/core/window_helpers.dart';
+import 'package:arya_app/src/features/assistant/models/ai_provider.dart';
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
 import 'package:arya_app/src/features/assistant/services/attachment_policy.dart';
 import 'package:arya_app/src/features/assistant/services/action_executor_service.dart';
@@ -53,6 +54,10 @@ class _TakeActionViewState extends State<TakeActionView> {
   int _activeApproachIndex = 0;
   String _latestCompletionLabel = '';
   String _latestCompletionReason = '';
+  _SpeculativeMilestonePlan? _speculativePlan;
+  String? _activeSpeculativePlanKey;
+  int _speculativePlanEpoch = 0;
+  _BulkPlanCache? _bulkPlanCache;
 
   @override
   void initState() {
@@ -109,6 +114,10 @@ class _TakeActionViewState extends State<TakeActionView> {
       _activeApproachIndex = 0;
       _latestCompletionLabel = '';
       _latestCompletionReason = '';
+      _speculativePlan = null;
+      _activeSpeculativePlanKey = null;
+      _speculativePlanEpoch++;
+      _bulkPlanCache = null;
       ActionExecutorService.instance.targetAppPid = null;
     });
     _controller.clear();
@@ -132,6 +141,7 @@ class _TakeActionViewState extends State<TakeActionView> {
       }
       _logs.add('Stopped by user.');
     });
+    _invalidateSpeculativePlan(discardBulkCache: true);
   }
 
   void _editCurrentTask() {
@@ -170,18 +180,38 @@ class _TakeActionViewState extends State<TakeActionView> {
     required List<ChatAttachment> attachments,
   }) async {
     final store = AiSettingsStore.instance;
-    final openRouterKey = await store.getApiKey();
-    final tavilyKey = await store.getTavilyApiKey();
-    final decompositionModel = await store.getDecompositionModel();
-    final planningModel = await store.getPlanningModel();
-    final completionModel = await store.getCompletionModel();
 
-    if (openRouterKey.isEmpty) {
+    // Load all settings and screen region in parallel.
+    final settingsAndRegion = await Future.wait([
+      store.getProvider(),           // 0
+      store.getOpenRouterApiKey(),   // 1
+      store.getOllamaBaseUrl(),      // 2
+      store.getTavilyApiKey(),       // 3
+      store.getDecompositionModel(), // 4
+      store.getPlanningModel(),      // 5
+      store.getCompletionModel(),    // 6
+      getCurrentWindowDisplayRegion().then((v) => v ?? <String, dynamic>{}), // 7
+    ]);
+
+    final provider = settingsAndRegion[0] as AiProvider;
+    final openRouterKey = settingsAndRegion[1] as String;
+    final ollamaBaseUrl = settingsAndRegion[2] as String;
+    final tavilyKey = settingsAndRegion[3] as String;
+    final decompositionModel = settingsAndRegion[4] as String;
+    final planningModel = settingsAndRegion[5] as String;
+    final completionModel = settingsAndRegion[6] as String;
+    final screenContext = settingsAndRegion[7] as Map<String, dynamic>;
+
+    if (decompositionModel.isEmpty ||
+        planningModel.isEmpty ||
+        completionModel.isEmpty) {
+      _setAbort('Select a model before running Take Action.');
+      return;
+    }
+    if (provider == AiProvider.openrouter && openRouterKey.isEmpty) {
       _setAbort('OpenRouter API key is missing. Set it in Settings.');
       return;
     }
-
-    final screenContext = await getCurrentWindowDisplayRegion() ?? {};
     final regionLeft = (screenContext['left'] as num?)?.toInt() ?? 0;
     final regionTop = (screenContext['top'] as num?)?.toInt() ?? 0;
     final regionWidth = (screenContext['width'] as num?)?.toInt() ?? 1800;
@@ -204,16 +234,43 @@ class _TakeActionViewState extends State<TakeActionView> {
     final attachmentMaps = attachments.map(_toAttachmentMap).toList();
     // --- Phase 1: Initial capture + decomposition prepass ---
     if (mounted) setState(() => _isPlanning = true);
-    await _captureContext('Initial context', region: captureRegion);
+
+    // For trivial tasks the decomposition uses a heuristic (no LLM, no UI
+    // summary needed), so we can fire it in parallel with the UI capture
+    // instead of waiting.
+    final isTrivial = TaskStrategyPlanner.isTrivialTask(task);
+    final captureFuture = _captureContext('Initial context', region: captureRegion);
+
+    TaskDecomposition? earlyDecomposition;
+    if (isTrivial) {
+      // Start heuristic decomposition without waiting for capture.
+      final decompFuture = _strategyPlanner.decompose(
+        provider: provider,
+        openRouterKey: openRouterKey,
+        ollamaBaseUrl: ollamaBaseUrl,
+        model: decompositionModel,
+        task: task,
+        appName: '',
+        uiSummary: '',
+      );
+      final results = await Future.wait([captureFuture, decompFuture]);
+      earlyDecomposition = results[1] as TaskDecomposition;
+    } else {
+      await captureFuture;
+    }
+
     final appContext = await _buildTargetAppContext();
     final appName =
         (appContext['target_app_name'] as String?)?.trim().toLowerCase() ?? '';
     try {
-      final decomposition = await _strategyPlanner.decompose(
+      final decomposition = earlyDecomposition ?? await _strategyPlanner.decompose(
+        provider: provider,
         openRouterKey: openRouterKey,
+        ollamaBaseUrl: ollamaBaseUrl,
         model: decompositionModel,
         task: task,
         appName: appName,
+        uiSummary: _buildInitialPlanningUiSummary(),
       );
       if (!mounted || !_isLoading) return;
       setState(() {
@@ -244,6 +301,56 @@ class _TakeActionViewState extends State<TakeActionView> {
       );
       for (var i = 0; i < decomposition.milestones.length; i++) {
         _log('  Milestone ${i + 1}: ${decomposition.milestones[i]}');
+      }
+
+      // --- Bulk planning: plan ALL milestones upfront in one LLM call ---
+      // Only attempted when there are 2+ milestones and a primary approach.
+      // Falls back to per-milestone planning on failure.
+      if (decomposition.milestones.length >= 2) {
+        final primaryApproach = decomposition.approaches.first;
+        try {
+          final plannerScreenContext = {
+            ...screenContext,
+            ...appContext,
+          };
+          _log(
+            'Bulk planning ${decomposition.milestones.length} milestones '
+            'with approach: ${primaryApproach.title}',
+          );
+          final bulkPlan = await _planner.generateBulkPlan(
+            provider: provider,
+            openRouterKey: openRouterKey,
+            ollamaBaseUrl: ollamaBaseUrl,
+            model: planningModel,
+            task: task,
+            milestones: decomposition.milestones,
+            approachTitle: primaryApproach.title,
+            milestoneStrategies: primaryApproach.milestoneStrategies,
+            screenContext: plannerScreenContext,
+            uiContext: formatUIElementsForPrompt(_latestUIElements),
+            screenshotPath: null,
+            tavilyKey: tavilyKey,
+            webMode: _webMode,
+            attachments: attachmentMaps,
+          );
+
+          final parsedCount = bulkPlan.milestonePlans
+              .where((p) => p != null)
+              .length;
+          _log(
+            'Bulk plan ready: $parsedCount/${decomposition.milestones.length} '
+            'milestones planned upfront.',
+          );
+
+          _bulkPlanCache = _BulkPlanCache(
+            milestonePlans: bulkPlan.milestonePlans.toList(),
+            uiSnapshot: _buildUiValidationSnapshot(_latestUIElements),
+            approachTitle: primaryApproach.title,
+          );
+        } catch (e) {
+          _log('Bulk planning failed, will plan per-milestone: $e');
+          _bulkPlanCache = null;
+        }
       }
 
       if (mounted) setState(() => _isPlanning = false);
@@ -303,33 +410,64 @@ class _TakeActionViewState extends State<TakeActionView> {
             ...await _buildTargetAppContext(),
           };
 
-          if (mounted) setState(() => _isPlanning = true);
-          _log(
-            'Planning milestone ${milestoneIndex + 1} with approach '
-            '${approachIndex + 1}/${decomposition.approaches.length}: '
-            '${approach.title}',
-          );
-
           late MilestonePlan milestonePlan;
           List<PlannedStep> plan;
           try {
-            milestonePlan = await _planner.generateFullPlan(
-              openRouterKey: openRouterKey,
-              model: planningModel,
-              task: task,
-              milestones: decomposition.milestones,
+            // Priority 1: Check the speculative plan (generated in background
+            // during the previous milestone's final steps).
+            final speculativePlan = _takeValidatedSpeculativePlan(
               milestoneIndex: milestoneIndex,
+              approachIndex: approachIndex,
               approachTitle: approach.title,
-              milestoneStrategy: milestoneStrategy,
-              completedMilestones: completedMilestones,
-              fallbackApproachTitles: fallbackApproachTitles,
-              screenContext: plannerScreenContext,
-              uiContext: formatUIElementsForPrompt(_latestUIElements),
-              screenshotPath: null,
-              tavilyKey: tavilyKey,
-              webMode: _webMode,
-              attachments: attachmentMaps,
             );
+            if (speculativePlan != null) {
+              milestonePlan = speculativePlan;
+            }
+            // Priority 2: Check the bulk plan cache (generated upfront for
+            // all milestones in one LLM call).
+            else if (_takeBulkPlanForMilestone(
+              milestoneIndex: milestoneIndex,
+              approachIndex: approachIndex,
+              approachTitle: approach.title,
+            ) case final bulkPlan?) {
+              milestonePlan = bulkPlan;
+            }
+            // Priority 3: Generate a fresh per-milestone plan.
+            // If a bulk cache exists but didn't yield a plan for this
+            // milestone, it was invalidated due to UI drift — inform
+            // the planner so it plans fresh without assumptions.
+            else {
+              final isBulkFallback = _bulkPlanCache != null &&
+                  approachIndex == 0 &&
+                  milestoneIndex > 0;
+              if (mounted) setState(() => _isPlanning = true);
+              _log(
+                'Planning milestone ${milestoneIndex + 1} with approach '
+                '${approachIndex + 1}/${decomposition.approaches.length}: '
+                '${approach.title}'
+                '${isBulkFallback ? ' (bulk plan invalidated, replanning fresh)' : ''}',
+              );
+              milestonePlan = await _planner.generateFullPlan(
+                provider: provider,
+                openRouterKey: openRouterKey,
+                ollamaBaseUrl: ollamaBaseUrl,
+                model: planningModel,
+                task: task,
+                milestones: decomposition.milestones,
+                milestoneIndex: milestoneIndex,
+                approachTitle: approach.title,
+                milestoneStrategy: milestoneStrategy,
+                completedMilestones: completedMilestones,
+                fallbackApproachTitles: fallbackApproachTitles,
+                screenContext: plannerScreenContext,
+                uiContext: formatUIElementsForPrompt(_latestUIElements),
+                screenshotPath: null,
+                tavilyKey: tavilyKey,
+                webMode: _webMode,
+                attachments: attachmentMaps,
+                isBulkFallback: isBulkFallback,
+              );
+            }
             plan = List<PlannedStep>.from(milestonePlan.steps);
           } catch (e) {
             if (mounted) setState(() => _isPlanning = false);
@@ -439,7 +577,11 @@ class _TakeActionViewState extends State<TakeActionView> {
                   break;
                 }
 
+                _invalidateSpeculativePlan(
+                  invalidateBulkFrom: milestoneIndex + 1,
+                );
                 milestonePlan = await _replan(
+                  provider: provider,
                   task: task,
                   milestones: decomposition.milestones,
                   milestoneIndex: milestoneIndex,
@@ -449,6 +591,7 @@ class _TakeActionViewState extends State<TakeActionView> {
                   fallbackApproachTitles: fallbackApproachTitles,
                   model: planningModel,
                   openRouterKey: openRouterKey,
+                  ollamaBaseUrl: ollamaBaseUrl,
                   screenContext: screenContext,
                   history: history,
                   failedStep: step,
@@ -492,6 +635,20 @@ class _TakeActionViewState extends State<TakeActionView> {
               final passed = step.verify.check(verifyElements);
               if (passed) {
                 _log('✓ Verify passed: ${step.verify}');
+                _maybeStartSpeculativeNextMilestonePlan(
+                  task: task,
+                  decomposition: decomposition,
+                  currentMilestoneIndex: milestoneIndex,
+                  provider: provider,
+                  openRouterKey: openRouterKey,
+                  ollamaBaseUrl: ollamaBaseUrl,
+                  model: planningModel,
+                  tavilyKey: tavilyKey,
+                  screenContext: screenContext,
+                  attachments: attachmentMaps,
+                  replansUsed: replansUsed,
+                  remainingSteps: plan.length,
+                );
                 continue;
               }
 
@@ -511,7 +668,11 @@ class _TakeActionViewState extends State<TakeActionView> {
                 break;
               }
 
+              _invalidateSpeculativePlan(
+                invalidateBulkFrom: milestoneIndex + 1,
+              );
               milestonePlan = await _replan(
+                provider: provider,
                 task: task,
                 milestones: decomposition.milestones,
                 milestoneIndex: milestoneIndex,
@@ -521,6 +682,7 @@ class _TakeActionViewState extends State<TakeActionView> {
                 fallbackApproachTitles: fallbackApproachTitles,
                 model: planningModel,
                 openRouterKey: openRouterKey,
+                ollamaBaseUrl: ollamaBaseUrl,
                 screenContext: screenContext,
                 history: history,
                 failedStep: step,
@@ -581,7 +743,9 @@ class _TakeActionViewState extends State<TakeActionView> {
                 ...await _buildTargetAppContext(),
               };
               milestoneComplete = await _planner.checkMilestoneCompletion(
+                provider: provider,
                 openRouterKey: openRouterKey,
+                ollamaBaseUrl: ollamaBaseUrl,
                 model: completionModel,
                 task: task,
                 milestones: decomposition.milestones,
@@ -632,7 +796,11 @@ class _TakeActionViewState extends State<TakeActionView> {
             }
 
             _log('Milestone incomplete, requesting additional steps…');
+            _invalidateSpeculativePlan(
+              invalidateBulkFrom: milestoneIndex + 1,
+            );
             milestonePlan = await _replan(
+              provider: provider,
               task: task,
               milestones: decomposition.milestones,
               milestoneIndex: milestoneIndex,
@@ -642,6 +810,7 @@ class _TakeActionViewState extends State<TakeActionView> {
               fallbackApproachTitles: fallbackApproachTitles,
               model: planningModel,
               openRouterKey: openRouterKey,
+              ollamaBaseUrl: ollamaBaseUrl,
               screenContext: screenContext,
               history: history,
               failedStep: lastExecutedStep,
@@ -689,6 +858,7 @@ class _TakeActionViewState extends State<TakeActionView> {
             return;
           }
           if (approachIndex + 1 < decomposition.approaches.length) {
+            _invalidateSpeculativePlan(discardBulkCache: true);
             _setApproachStatus(
               milestoneIndex,
               approachIndex,
@@ -724,6 +894,7 @@ class _TakeActionViewState extends State<TakeActionView> {
         }
       }
 
+      _invalidateSpeculativePlan(discardBulkCache: true);
       _log('✓ Task verified as complete.');
     } catch (e) {
       if (mounted) setState(() => _isPlanning = false);
@@ -734,6 +905,7 @@ class _TakeActionViewState extends State<TakeActionView> {
 
   /// Captures fresh context and calls LLM to produce a new plan.
   Future<MilestonePlan> _replan({
+    required AiProvider provider,
     required String task,
     required List<String> milestones,
     required int milestoneIndex,
@@ -743,6 +915,7 @@ class _TakeActionViewState extends State<TakeActionView> {
     required List<String> fallbackApproachTitles,
     required String model,
     required String openRouterKey,
+    required String ollamaBaseUrl,
     required Map<String, dynamic> screenContext,
     required List<Map<String, String>> history,
     required PlannedStep failedStep,
@@ -763,7 +936,9 @@ class _TakeActionViewState extends State<TakeActionView> {
 
     try {
       final newPlan = await _planner.replanFromFailure(
+        provider: provider,
         openRouterKey: openRouterKey,
+        ollamaBaseUrl: ollamaBaseUrl,
         model: model,
         task: task,
         milestones: milestones,
@@ -1090,6 +1265,7 @@ class _TakeActionViewState extends State<TakeActionView> {
       _abortReason = reason;
       _logs.add('Aborted: $reason');
     });
+    _invalidateSpeculativePlan(discardBulkCache: true);
   }
 
   void _setMilestoneStatus(int milestoneIndex, String status, {String detail = ''}) {
@@ -1125,6 +1301,37 @@ class _TakeActionViewState extends State<TakeActionView> {
       );
       _milestoneProgress[milestoneIndex] = _milestoneProgress[milestoneIndex]
           .copyWith(approaches: updatedApproaches);
+    });
+  }
+
+  /// Invalidates the speculative plan and optionally invalidates bulk plan
+  /// cache entries.
+  ///
+  /// If [invalidateBulkFrom] is provided, all bulk cache entries from that
+  /// milestone index onward are invalidated (used when a replan occurs and
+  /// later bulk plans are based on a now-stale UI assumption).
+  ///
+  /// If [discardBulkCache] is true, the entire bulk cache is discarded
+  /// (used when switching approaches, since the bulk cache was generated
+  /// for the primary approach only).
+  void _invalidateSpeculativePlan({
+    int? invalidateBulkFrom,
+    bool discardBulkCache = false,
+  }) {
+    _speculativePlanEpoch++;
+    if (discardBulkCache) {
+      _bulkPlanCache = null;
+    } else if (invalidateBulkFrom != null) {
+      _bulkPlanCache?.invalidateFrom(invalidateBulkFrom);
+    }
+    if (!mounted) {
+      _speculativePlan = null;
+      _activeSpeculativePlanKey = null;
+      return;
+    }
+    setState(() {
+      _speculativePlan = null;
+      _activeSpeculativePlanKey = null;
     });
   }
 
@@ -1250,6 +1457,337 @@ class _TakeActionViewState extends State<TakeActionView> {
       if (exePath.isNotEmpty) 'target_executable_path': exePath,
       if (windowTitle != null) 'target_window_title': windowTitle,
     };
+  }
+
+  String _buildInitialPlanningUiSummary() {
+    if (_latestUIElements.isEmpty) {
+      return '';
+    }
+
+    final topLabeled = <String>[];
+    final seenLabels = <String>{};
+    for (final el in _latestUIElements) {
+      final label = el.label.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (label.isEmpty) continue;
+      final normalized = label.toLowerCase();
+      if (!seenLabels.add(normalized)) continue;
+      topLabeled.add('${el.role}: $label');
+      if (topLabeled.length >= 8) break;
+    }
+
+    final dialogs = _latestUIElements
+        .where(
+          (el) =>
+              el.role == 'Dialog' || el.role == 'Sheet' || el.role == 'Alert',
+        )
+        .toList();
+    final editableCount = _latestUIElements
+        .where(
+          (el) =>
+              el.role == 'TextArea' ||
+              el.role == 'TextField' ||
+              el.role == 'SearchField' ||
+              el.role == 'ComboBox',
+        )
+        .length;
+    final buttonsCount =
+        _latestUIElements.where((el) => el.role == 'Button').length;
+    final selectedWindowTitle = _extractPrimaryWindowTitle(_latestUIElements);
+
+    final stateHints = <String>[
+      if (selectedWindowTitle != null && selectedWindowTitle.isNotEmpty)
+        'window="$selectedWindowTitle"',
+      if (dialogs.isNotEmpty) 'dialog_or_sheet_visible',
+      if (editableCount > 0) '$editableCount editable_input_controls_visible',
+      if (buttonsCount > 0) '$buttonsCount buttons_visible',
+    ];
+
+    final buffer = StringBuffer();
+    if (stateHints.isNotEmpty) {
+      buffer.writeln('State hints: ${stateHints.join(', ')}');
+    }
+    if (topLabeled.isNotEmpty) {
+      buffer.writeln('High-signal visible elements:');
+      for (final line in topLabeled) {
+        buffer.writeln('- $line');
+      }
+    }
+    return buffer.toString().trim();
+  }
+
+  String _buildUiValidationKey({
+    required int milestoneIndex,
+    required int approachIndex,
+    required String approachTitle,
+  }) => '$milestoneIndex::$approachIndex::$approachTitle';
+
+  _UiValidationSnapshot _buildUiValidationSnapshot(List<UIElement> elements) {
+    final labels = <String>{};
+    for (final el in elements) {
+      final label = el.label.replaceAll(RegExp(r'\s+'), ' ').trim().toLowerCase();
+      if (label.isEmpty) continue;
+      labels.add('${el.role.toLowerCase()}:$label');
+      if (labels.length >= 10) break;
+    }
+
+    String bucket(int count) {
+      if (count <= 0) return '0';
+      if (count == 1) return '1';
+      if (count <= 4) return '2-4';
+      return '5+';
+    }
+
+    final dialogs = elements
+        .where(
+          (el) =>
+              el.role == 'Dialog' || el.role == 'Sheet' || el.role == 'Alert',
+        )
+        .length;
+    final editable = elements
+        .where(
+          (el) =>
+              el.role == 'TextArea' ||
+              el.role == 'TextField' ||
+              el.role == 'SearchField' ||
+              el.role == 'ComboBox',
+        )
+        .length;
+    final buttons = elements.where((el) => el.role == 'Button').length;
+
+    return _UiValidationSnapshot(
+      windowTitle: (_extractPrimaryWindowTitle(elements) ?? '').trim().toLowerCase(),
+      labels: labels,
+      dialogBucket: bucket(dialogs),
+      editableBucket: bucket(editable),
+      buttonBucket: bucket(buttons),
+    );
+  }
+
+  bool _isUiValidationSnapshotCompatible(
+    _UiValidationSnapshot expected,
+    _UiValidationSnapshot actual,
+  ) {
+    if (expected.windowTitle.isNotEmpty &&
+        actual.windowTitle.isNotEmpty &&
+        expected.windowTitle != actual.windowTitle) {
+      return false;
+    }
+    if (expected.dialogBucket != actual.dialogBucket ||
+        expected.editableBucket != actual.editableBucket) {
+      return false;
+    }
+    if (expected.labels.isEmpty) {
+      return true;
+    }
+    final overlap = expected.labels.intersection(actual.labels).length;
+    return overlap / expected.labels.length >= 0.5;
+  }
+
+  void _maybeStartSpeculativeNextMilestonePlan({
+    required String task,
+    required TaskDecomposition decomposition,
+    required int currentMilestoneIndex,
+    required AiProvider provider,
+    required String openRouterKey,
+    required String ollamaBaseUrl,
+    required String model,
+    required String tavilyKey,
+    required Map<String, dynamic> screenContext,
+    required List<Map<String, dynamic>> attachments,
+    required int replansUsed,
+    required int remainingSteps,
+  }) {
+    final nextMilestoneIndex = currentMilestoneIndex + 1;
+    if (nextMilestoneIndex >= decomposition.milestones.length) return;
+    if (replansUsed > 0 || remainingSteps > 1) return;
+
+    // Skip speculative planning if the bulk cache already has a plan for the
+    // next milestone — no need to start a redundant background LLM call.
+    if (_bulkPlanCache != null &&
+        nextMilestoneIndex < _bulkPlanCache!.milestonePlans.length &&
+        _bulkPlanCache!.milestonePlans[nextMilestoneIndex] != null) {
+      return;
+    }
+
+    final approach = decomposition.approaches.first;
+    final requestKey = _buildUiValidationKey(
+      milestoneIndex: nextMilestoneIndex,
+      approachIndex: 0,
+      approachTitle: approach.title,
+    );
+    if (_activeSpeculativePlanKey == requestKey) return;
+    if (_speculativePlan != null && _speculativePlan!.requestKey == requestKey) {
+      return;
+    }
+
+    final assumedCompletedMilestones =
+        decomposition.milestones.take(currentMilestoneIndex + 1).toList();
+    final fallbackApproachTitles = decomposition.approaches
+        .skip(1)
+        .map((a) => a.title)
+        .toList();
+    final uiSnapshot = _buildUiValidationSnapshot(_latestUIElements);
+    final uiSummary = _buildInitialPlanningUiSummary();
+    final requestEpoch = ++_speculativePlanEpoch;
+
+    if (mounted) {
+      setState(() => _activeSpeculativePlanKey = requestKey);
+    } else {
+      _activeSpeculativePlanKey = requestKey;
+    }
+
+    _log(
+      'Starting speculative plan for milestone ${nextMilestoneIndex + 1} '
+      'with approach 1/${decomposition.approaches.length}: ${approach.title}',
+    );
+
+    unawaited(() async {
+      try {
+        final plannerScreenContext = {
+          ...screenContext,
+          ...await _buildTargetAppContext(),
+        };
+        final plan = await _planner.generateFullPlan(
+          provider: provider,
+          openRouterKey: openRouterKey,
+          ollamaBaseUrl: ollamaBaseUrl,
+          model: model,
+          task: task,
+          milestones: decomposition.milestones,
+          milestoneIndex: nextMilestoneIndex,
+          approachTitle: approach.title,
+          milestoneStrategy: approach.strategyForMilestone(
+            nextMilestoneIndex,
+            decomposition.milestones[nextMilestoneIndex],
+          ),
+          completedMilestones: assumedCompletedMilestones,
+          fallbackApproachTitles: fallbackApproachTitles,
+          screenContext: plannerScreenContext,
+          uiContext: formatUIElementsForPrompt(_latestUIElements),
+          screenshotPath: null,
+          tavilyKey: tavilyKey,
+          webMode: _webMode,
+          attachments: attachments,
+        );
+
+        if (!mounted ||
+            !_isLoading ||
+            requestEpoch != _speculativePlanEpoch ||
+            _activeSpeculativePlanKey != requestKey) {
+          return;
+        }
+
+        setState(() {
+          _speculativePlan = _SpeculativeMilestonePlan(
+            requestKey: requestKey,
+            milestoneIndex: nextMilestoneIndex,
+            approachIndex: 0,
+            approachTitle: approach.title,
+            uiSummary: uiSummary,
+            uiSnapshot: uiSnapshot,
+            plan: plan,
+          );
+          _activeSpeculativePlanKey = null;
+        });
+        _log(
+          'Speculative plan ready for milestone ${nextMilestoneIndex + 1} '
+          '(${plan.steps.length} steps).',
+        );
+      } catch (e) {
+        if (mounted &&
+            requestEpoch == _speculativePlanEpoch &&
+            _activeSpeculativePlanKey == requestKey) {
+          setState(() => _activeSpeculativePlanKey = null);
+        }
+        _log('Speculative planning skipped: $e');
+      }
+    }());
+  }
+
+  MilestonePlan? _takeValidatedSpeculativePlan({
+    required int milestoneIndex,
+    required int approachIndex,
+    required String approachTitle,
+  }) {
+    final speculativePlan = _speculativePlan;
+    if (speculativePlan == null) return null;
+    if (speculativePlan.milestoneIndex != milestoneIndex ||
+        speculativePlan.approachIndex != approachIndex ||
+        speculativePlan.approachTitle != approachTitle) {
+      return null;
+    }
+
+    final liveSnapshot = _buildUiValidationSnapshot(_latestUIElements);
+    if (!_isUiValidationSnapshotCompatible(
+      speculativePlan.uiSnapshot,
+      liveSnapshot,
+    )) {
+      _log(
+        'Discarded speculative plan for milestone ${milestoneIndex + 1}: '
+        'UI drifted beyond validation guardrails.',
+      );
+      _invalidateSpeculativePlan();
+      return null;
+    }
+
+    final plan = speculativePlan.plan;
+    _log(
+      'Using speculative plan for milestone ${milestoneIndex + 1} '
+      '(${plan.steps.length} steps).',
+    );
+    _invalidateSpeculativePlan();
+    return plan;
+  }
+
+  /// Attempts to retrieve a pre-computed plan for [milestoneIndex] from the
+  /// bulk plan cache.
+  ///
+  /// Returns `null` (and falls through to per-milestone planning) when:
+  /// - No bulk cache exists.
+  /// - The cache was built for a different approach.
+  /// - This is not the primary approach (index 0).
+  /// - The UI has drifted beyond compatibility thresholds.
+  ///
+  /// On UI drift, all plans from [milestoneIndex] onward are invalidated
+  /// (they were planned from an increasingly stale UI estimate).
+  MilestonePlan? _takeBulkPlanForMilestone({
+    required int milestoneIndex,
+    required int approachIndex,
+    required String approachTitle,
+  }) {
+    final cache = _bulkPlanCache;
+    if (cache == null) return null;
+
+    // Bulk plans are only generated for the primary approach.
+    if (approachIndex != 0 || cache.approachTitle != approachTitle) {
+      return null;
+    }
+
+    // For milestone 0 the UI hasn't changed since bulk planning, so skip
+    // the drift check.  For later milestones, validate against live UI.
+    if (milestoneIndex > 0) {
+      final liveSnapshot = _buildUiValidationSnapshot(_latestUIElements);
+      if (!_isUiValidationSnapshotCompatible(
+        cache.uiSnapshot,
+        liveSnapshot,
+      )) {
+        _log(
+          'Bulk plan cache invalidated from milestone ${milestoneIndex + 1} '
+          'onward: UI drifted beyond validation guardrails.',
+        );
+        cache.invalidateFrom(milestoneIndex);
+        return null;
+      }
+    }
+
+    final plan = cache.consume(milestoneIndex);
+    if (plan == null) return null;
+
+    _log(
+      'Using bulk-planned steps for milestone ${milestoneIndex + 1} '
+      '(${plan.steps.length} steps).',
+    );
+    return plan;
   }
 
   String? _extractPrimaryWindowTitle(List<UIElement> elements) {
@@ -1825,6 +2363,90 @@ class _CapturedScreenshot {
   final String path;
   final String label;
   final DateTime createdAt;
+}
+
+class _UiValidationSnapshot {
+  const _UiValidationSnapshot({
+    required this.windowTitle,
+    required this.labels,
+    required this.dialogBucket,
+    required this.editableBucket,
+    required this.buttonBucket,
+  });
+
+  final String windowTitle;
+  final Set<String> labels;
+  final String dialogBucket;
+  final String editableBucket;
+  final String buttonBucket;
+}
+
+class _SpeculativeMilestonePlan {
+  const _SpeculativeMilestonePlan({
+    required this.requestKey,
+    required this.milestoneIndex,
+    required this.approachIndex,
+    required this.approachTitle,
+    required this.uiSummary,
+    required this.uiSnapshot,
+    required this.plan,
+  });
+
+  final String requestKey;
+  final int milestoneIndex;
+  final int approachIndex;
+  final String approachTitle;
+  final String uiSummary;
+  final _UiValidationSnapshot uiSnapshot;
+  final MilestonePlan plan;
+}
+
+/// Holds pre-computed plans for ALL milestones from a single bulk LLM call.
+///
+/// Each milestone entry starts non-null and is set to `null` once consumed
+/// or invalidated due to UI drift.  The [uiSnapshot] is taken at bulk-plan
+/// time and compared against the live UI at each milestone boundary.
+///
+/// Only used for approach index 0 (the primary approach). If the primary
+/// approach fails and the system falls back to a secondary approach, the
+/// bulk cache is discarded entirely and per-milestone planning takes over.
+class _BulkPlanCache {
+  _BulkPlanCache({
+    required this.milestonePlans,
+    required this.uiSnapshot,
+    required this.approachTitle,
+  });
+
+  /// Indexed by milestone order. `null` = consumed or invalidated.
+  final List<MilestonePlan?> milestonePlans;
+
+  /// UI snapshot taken at bulk-planning time for drift detection.
+  final _UiValidationSnapshot uiSnapshot;
+
+  /// The approach these plans were generated for.
+  final String approachTitle;
+
+  /// Consume the plan for [milestoneIndex], returning it and setting the
+  /// slot to `null` so it cannot be reused.
+  MilestonePlan? consume(int milestoneIndex) {
+    if (milestoneIndex < 0 || milestoneIndex >= milestonePlans.length) {
+      return null;
+    }
+    final plan = milestonePlans[milestoneIndex];
+    milestonePlans[milestoneIndex] = null;
+    return plan;
+  }
+
+  /// Invalidate all plans from [fromIndex] onward (inclusive).
+  void invalidateFrom(int fromIndex) {
+    for (var i = fromIndex; i < milestonePlans.length; i++) {
+      milestonePlans[i] = null;
+    }
+  }
+
+  /// Whether any unconsumed plans remain.
+  bool get hasRemainingPlans =>
+      milestonePlans.any((plan) => plan != null);
 }
 
 // ---------------------------------------------------------------------------

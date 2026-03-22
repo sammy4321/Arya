@@ -1,8 +1,10 @@
 import 'dart:convert';
 
+import 'package:arya_app/src/features/assistant/models/ai_provider.dart';
 import 'package:arya_app/src/features/assistant/models/chat_models.dart';
 import 'package:arya_app/src/features/assistant/services/ai_validation.dart';
 import 'package:arya_app/src/features/assistant/services/chat_orchestrator.dart';
+import 'package:arya_app/src/features/assistant/services/ollama_client.dart';
 import 'package:arya_app/src/features/settings/ai_settings_store.dart';
 import 'package:pdfrx/pdfrx.dart';
 
@@ -18,22 +20,27 @@ class AiService {
     List<ChatMessage> messages,
   ) async {
     final store = AiSettingsStore.instance;
-    final openRouterKey = await store.getApiKey();
+    final provider = await store.getProvider();
+    final openRouterKey = await store.getOpenRouterApiKey();
+    final ollamaBaseUrl = await store.getOllamaBaseUrl();
     final tavilyKey = await store.getTavilyApiKey();
     final model = await store.getModel();
 
-    final configIssue = getOpenRouterConfigIssue(
-      apiKey: openRouterKey,
-      model: model,
-    );
-    if (configIssue == OpenRouterConfigIssue.missingModel) {
+    if (model.isEmpty) {
       throw const AiException(
         'Please select a model before sending a message.',
       );
     }
-    if (configIssue == OpenRouterConfigIssue.missingApiKey) {
+    if (provider == AiProvider.openrouter &&
+        getOpenRouterConfigIssue(apiKey: openRouterKey, model: model) ==
+            OpenRouterConfigIssue.missingApiKey) {
       throw const AiException(
         'OpenRouter API key is missing. Set it in Settings.',
+      );
+    }
+    if (provider == AiProvider.ollama && ollamaBaseUrl.trim().isEmpty) {
+      throw AiException(
+        'Ollama base URL is missing. Set it in Settings or use ${OllamaClient.defaultBaseUrl}.',
       );
     }
 
@@ -42,7 +49,9 @@ class AiService {
     );
 
     final result = await _orchestrator.respond(
+      provider: provider,
       openRouterKey: openRouterKey,
+      ollamaBaseUrl: ollamaBaseUrl,
       tavilyKey: tavilyKey,
       model: model,
       webMode: 'auto',
@@ -58,22 +67,27 @@ class AiService {
 
   Stream<AiStreamChunk> streamChatMessage(List<ChatMessage> messages) async* {
     final store = AiSettingsStore.instance;
-    final openRouterKey = await store.getApiKey();
+    final provider = await store.getProvider();
+    final openRouterKey = await store.getOpenRouterApiKey();
+    final ollamaBaseUrl = await store.getOllamaBaseUrl();
     final tavilyKey = await store.getTavilyApiKey();
     final model = await store.getModel();
 
-    final configIssue = getOpenRouterConfigIssue(
-      apiKey: openRouterKey,
-      model: model,
-    );
-    if (configIssue == OpenRouterConfigIssue.missingModel) {
+    if (model.isEmpty) {
       throw const AiException(
         'Please select a model before sending a message.',
       );
     }
-    if (configIssue == OpenRouterConfigIssue.missingApiKey) {
+    if (provider == AiProvider.openrouter &&
+        getOpenRouterConfigIssue(apiKey: openRouterKey, model: model) ==
+            OpenRouterConfigIssue.missingApiKey) {
       throw const AiException(
         'OpenRouter API key is missing. Set it in Settings.',
+      );
+    }
+    if (provider == AiProvider.ollama && ollamaBaseUrl.trim().isEmpty) {
+      throw AiException(
+        'Ollama base URL is missing. Set it in Settings or use ${OllamaClient.defaultBaseUrl}.',
       );
     }
 
@@ -82,7 +96,9 @@ class AiService {
     );
 
     await for (final chunk in _orchestrator.respondStream(
+      provider: provider,
       openRouterKey: openRouterKey,
+      ollamaBaseUrl: ollamaBaseUrl,
       tavilyKey: tavilyKey,
       model: model,
       webMode: 'auto',

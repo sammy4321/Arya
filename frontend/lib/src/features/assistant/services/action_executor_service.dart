@@ -1,5 +1,7 @@
 import 'dart:io';
+import 'dart:ui' show Offset;
 
+import 'package:arya_app/src/core/window_helpers.dart';
 import 'package:flutter/foundation.dart';
 import 'package:nutdart/nutdart.dart';
 
@@ -108,32 +110,38 @@ class ActionExecutorService {
 
   Future<ActionResult> _click(Map<String, dynamic> args) async {
     try {
-      await activateTargetApp();
+      final x = (args['x'] as num?)?.toInt();
+      final y = (args['y'] as num?)?.toInt();
 
-      if (args.containsKey('x') && args.containsKey('y')) {
-        final x = (args['x'] as num?)?.toInt() ?? 0;
-        final y = (args['y'] as num?)?.toInt() ?? 0;
-        Mouse.moveTo(x, y);
-        await Future<void>.delayed(const Duration(milliseconds: 150));
-      }
+      return withAssistantWindowHiddenIfObscuringPoint(
+        point: Offset((x ?? 0).toDouble(), (y ?? 0).toDouble()),
+        action: () async {
+          await activateTargetApp();
 
-      final button = (args['button'] as String? ?? 'left').toLowerCase();
-      final clicks = (args['clicks'] as num?)?.toInt() ?? 1;
+          if (x != null && y != null) {
+            Mouse.moveTo(x, y);
+            await Future<void>.delayed(const Duration(milliseconds: 150));
+          }
 
-      final mouseButton =
-          button == 'right' ? MouseButton.right : MouseButton.left;
+          final button = (args['button'] as String? ?? 'left').toLowerCase();
+          final clicks = (args['clicks'] as num?)?.toInt() ?? 1;
 
-      for (var i = 0; i < clicks.clamp(1, 3); i++) {
-        Mouse.click(mouseButton);
-        if (i < clicks - 1) {
-          await Future<void>.delayed(const Duration(milliseconds: 60));
-        }
-      }
+          final mouseButton =
+              button == 'right' ? MouseButton.right : MouseButton.left;
 
-      final pos = Mouse.getPosition();
-      return ActionResult(
-        ok: true,
-        detail: 'Clicked $button at (${pos.x},${pos.y})',
+          for (var i = 0; i < clicks.clamp(1, 3); i++) {
+            Mouse.click(mouseButton);
+            if (i < clicks - 1) {
+              await Future<void>.delayed(const Duration(milliseconds: 60));
+            }
+          }
+
+          final pos = Mouse.getPosition();
+          return ActionResult(
+            ok: true,
+            detail: 'Clicked $button at (${pos.x},${pos.y})',
+          );
+        },
       );
     } catch (e) {
       return ActionResult(ok: false, detail: 'click failed: $e');

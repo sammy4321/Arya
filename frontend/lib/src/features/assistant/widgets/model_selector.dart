@@ -1,7 +1,8 @@
+import 'package:arya_app/src/features/assistant/models/ai_provider.dart';
 import 'package:arya_app/src/features/settings/ai_settings_store.dart';
 import 'package:flutter/material.dart';
 
-/// A dropdown selector for OpenRouter models.
+/// A dropdown selector for provider-backed models.
 class ModelSelector extends StatefulWidget {
   const ModelSelector({
     required this.onModelSelected,
@@ -20,7 +21,8 @@ class _ModelSelectorState extends State<ModelSelector> {
   bool _isLoading = false;
   bool _isDropdownOpen = false;
   String? _error;
-  List<OpenRouterModel> _models = [];
+  AiProvider _provider = AiProvider.openrouter;
+  List<AiModelOption> _models = [];
   String _selectedModelId = '';
   String _searchQuery = '';
 
@@ -45,11 +47,21 @@ class _ModelSelectorState extends State<ModelSelector> {
   }
 
   Future<void> _loadModel() async {
-    final savedModel = await AiSettingsStore.instance.getModel();
-    if (savedModel.isNotEmpty && mounted) {
-      setState(() => _selectedModelId = savedModel);
-    }
-    _fetchModels();
+    await _refreshProviderAndSelection();
+    await _fetchModels();
+  }
+
+  Future<void> _refreshProviderAndSelection() async {
+    final store = AiSettingsStore.instance;
+    final provider = await store.getProvider();
+    final savedModel = await store.getModel();
+    if (!mounted) return;
+    setState(() {
+      _provider = provider;
+      if (savedModel.isNotEmpty) {
+        _selectedModelId = savedModel;
+      }
+    });
   }
 
   Future<void> _fetchModels() async {
@@ -59,7 +71,7 @@ class _ModelSelectorState extends State<ModelSelector> {
       _error = null;
     });
     try {
-      final models = await AiSettingsStore.instance.fetchModels();
+      final models = await AiSettingsStore.instance.fetchAvailableModels();
       if (mounted) {
         setState(() => _models = models);
       }
@@ -74,14 +86,14 @@ class _ModelSelectorState extends State<ModelSelector> {
     }
   }
 
-  Future<void> _selectModel(OpenRouterModel model) async {
+  Future<void> _selectModel(AiModelOption model) async {
     setState(() => _selectedModelId = model.id);
     await AiSettingsStore.instance.setModel(model.id);
     widget.onModelSelected(model.id);
     _removeOverlay();
   }
 
-  List<OpenRouterModel> get _filteredModels {
+  List<AiModelOption> get _filteredModels {
     if (_searchQuery.isEmpty) return _models;
     final q = _searchQuery.toLowerCase();
     return _models
@@ -94,16 +106,18 @@ class _ModelSelectorState extends State<ModelSelector> {
   }
 
   String get _displayLabel {
-    if (_selectedModelId.isEmpty) return 'Select model';
+    if (_selectedModelId.isEmpty) return 'Select ${_provider.label} model';
     final match = _models.where((m) => m.id == _selectedModelId);
     if (match.isNotEmpty) return match.first.name;
     return _selectedModelId;
   }
 
-  void _toggleDropdown() {
+  Future<void> _toggleDropdown() async {
     if (_isDropdownOpen) {
       _removeOverlay();
     } else {
+      await _refreshProviderAndSelection();
+      await _fetchModels();
       _showOverlay();
     }
   }
@@ -212,11 +226,11 @@ class _ModelSelectorState extends State<ModelSelector> {
                           ),
                         )
                       else if (filtered.isEmpty)
-                        const Padding(
-                          padding: EdgeInsets.all(12),
+                        Padding(
+                          padding: const EdgeInsets.all(12),
                           child: Text(
-                            'No models found',
-                            style: TextStyle(
+                            _error ?? 'No ${_provider.label} models found',
+                            style: const TextStyle(
                               color: Color(0xFF6B7585),
                               fontSize: 12,
                             ),
@@ -288,7 +302,7 @@ class _ModelSelectorState extends State<ModelSelector> {
     return CompositedTransformTarget(
       link: _dropdownLink,
       child: GestureDetector(
-        onTap: _isLoading && _models.isEmpty ? null : _toggleDropdown,
+        onTap: _isLoading && _models.isEmpty ? null : () => _toggleDropdown(),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
           decoration: BoxDecoration(

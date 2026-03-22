@@ -1,20 +1,7 @@
 import 'dart:convert';
 
+import 'package:arya_app/src/features/assistant/services/llm_types.dart';
 import 'package:http/http.dart' as http;
-
-class OpenRouterStreamChunk {
-  const OpenRouterStreamChunk({this.contentDelta = '', this.reasoningDelta = ''});
-
-  final String contentDelta;
-  final String reasoningDelta;
-}
-
-class OpenRouterCompletion {
-  const OpenRouterCompletion({this.content = '', this.reasoning = ''});
-
-  final String content;
-  final String reasoning;
-}
 
 /// Direct Dart client for the OpenRouter chat completions API.
 class OpenRouterClient {
@@ -34,7 +21,7 @@ class OpenRouterClient {
     return completion.content;
   }
 
-  Future<OpenRouterCompletion> chatCompletionDetailed({
+  Future<LlmCompletion> chatCompletionDetailed({
     required String apiKey,
     required String model,
     required List<Map<String, dynamic>> messages,
@@ -61,7 +48,7 @@ class OpenRouterClient {
 
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
     final choices = payload['choices'] as List<dynamic>? ?? [];
-    if (choices.isEmpty) return const OpenRouterCompletion();
+    if (choices.isEmpty) return const LlmCompletion();
     final message =
         (choices.first as Map<String, dynamic>)['message'] as Map<String, dynamic>? ?? {};
     final content = _extractText(message['content'] ?? message['text']);
@@ -70,10 +57,10 @@ class OpenRouterClient {
           message['reasoning_content'] ??
           message['reasoning_text'],
     );
-    return OpenRouterCompletion(content: content, reasoning: reasoning);
+    return LlmCompletion(content: content, reasoning: reasoning);
   }
 
-  Stream<OpenRouterStreamChunk> chatCompletionStream({
+  Stream<LlmStreamChunk> chatCompletionStream({
     required String apiKey,
     required String model,
     required List<Map<String, dynamic>> messages,
@@ -153,7 +140,7 @@ class OpenRouterClient {
           }
         }
         if (contentDelta.isEmpty && reasoningDelta.isEmpty) continue;
-        yield OpenRouterStreamChunk(
+        yield LlmStreamChunk(
           contentDelta: contentDelta,
           reasoningDelta: reasoningDelta,
         );

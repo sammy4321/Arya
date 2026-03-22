@@ -1,8 +1,11 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:arya_app/src/features/assistant/models/ai_provider.dart';
 import 'package:arya_app/src/features/assistant/services/ai_validation.dart';
+import 'package:arya_app/src/features/assistant/services/llm_types.dart';
 import 'package:arya_app/src/features/assistant/services/openrouter_client.dart';
+import 'package:arya_app/src/features/assistant/services/ollama_client.dart';
 import 'package:arya_app/src/features/assistant/services/tavily_client.dart';
 import 'package:arya_app/src/features/assistant/services/ui_parser_service.dart';
 import 'package:arya_app/src/features/assistant/services/web_context_helper.dart';
@@ -174,6 +177,15 @@ class MilestonePlan {
   final CompletionContract completionContract;
 }
 
+/// Holds plans for ALL milestones produced by a single LLM call.
+/// Each entry is indexed by milestone order. A `null` entry means
+/// that milestone's plan was not parseable or has been consumed.
+class BulkMilestonePlan {
+  const BulkMilestonePlan({required this.milestonePlans});
+
+  final List<MilestonePlan?> milestonePlans;
+}
+
 // ---------------------------------------------------------------------------
 // StepPlanner — generates a full plan upfront, re-plans only on failure.
 // ---------------------------------------------------------------------------
@@ -181,15 +193,18 @@ class MilestonePlan {
 class StepPlanner {
   StepPlanner({
     OpenRouterClient? openRouterClient,
+    OllamaClient? ollamaClient,
     TavilyClient? tavilyClient,
     PlannerTraceLogger? traceLogger,
     PlannerReasoningLogger? reasoningLogger,
   }) : _traceLogger = traceLogger,
        _reasoningLogger = reasoningLogger,
        _openRouter = openRouterClient ?? OpenRouterClient(),
+       _ollama = ollamaClient ?? OllamaClient(),
        _tavily = tavilyClient ?? TavilyClient();
 
   final OpenRouterClient _openRouter;
+  final OllamaClient _ollama;
   final TavilyClient _tavily;
   final PlannerTraceLogger? _traceLogger;
   final PlannerReasoningLogger? _reasoningLogger;
@@ -206,7 +221,7 @@ class StepPlanner {
   static String _actionsBlock() => '''
 ## Available actions
 - click: {element_id, position?, button?, clicks?} — click a UI element by [id]. Position: "center" (default), "top_left", "top_right", "bottom_left", "bottom_right". Button: "left" (default) or "right".
-  For LATER steps where the UI will have changed after earlier steps, use match instead of element_id:
+  Alternatively, use match to find elements dynamically:
   click: {match_role?, match_label?, position?, button?} — the system finds the first element whose role equals match_role AND whose label/desc/value contains match_label, then clicks it.
 - type_text: {text}
 - press_keys: {keys: ["Enter"]}
@@ -255,7 +270,9 @@ Use hierarchy to improve disambiguation:
   // -----------------------------------------------------------------------
 
   Future<MilestonePlan> generateFullPlan({
+    required AiProvider provider,
     required String openRouterKey,
+    required String ollamaBaseUrl,
     required String model,
     required String task,
     required List<String> milestones,
@@ -270,8 +287,9 @@ Use hierarchy to improve disambiguation:
     String tavilyKey = '',
     String webMode = 'auto',
     List<Map<String, dynamic>> attachments = const [],
+    bool isBulkFallback = false,
   }) async {
-    _validateKeys(openRouterKey, model);
+    _validateKeys(provider, openRouterKey, model);
 
     final webContext = await _maybeWebContext(
       tavilyKey: tavilyKey,
@@ -323,7 +341,10 @@ ${_safetyBlock()}
 - Use the selected approach below as your primary route for this milestone.
 - You may adapt within the same approach if the UI differs slightly, but do NOT switch to a fallback approach unless explicitly told in a later call.
 - Return [] only if the current milestone is already complete in the current UI state.
-
+${isBulkFallback ? '''
+## Context
+A previous plan for this milestone was generated speculatively (before the UI reached this state) and was discarded because the actual UI diverged from expectations. Plan fresh from the current UI state — do not assume anything about prior planning attempts.
+''' : ''}
 ## Current milestone
 - Milestone ${milestoneIndex + 1} of ${milestones.length}: $currentMilestone
 - Selected approach: $approachTitle
@@ -368,6 +389,8 @@ Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then 
 
     final raw = await _callPlannerRaw(
       openRouterKey: openRouterKey,
+      ollamaBaseUrl: ollamaBaseUrl,
+      provider: provider,
       model: model,
       systemPrompt: systemPrompt,
       userPrompt: userPrompt,
@@ -379,11 +402,230 @@ Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then 
   }
 
   // -----------------------------------------------------------------------
+  // generateBulkPlan — plans ALL milestones in a single LLM call.
+  //
+  // Later milestone plans use match_role / match_label exclusively since
+  // the UI will have changed by the time they execute.  The caller must
+  // validate each milestone's plan against the live UI before execution
+  // and fall back to per-milestone generateFullPlan on UI drift.
+  // -----------------------------------------------------------------------
+
+  Future<BulkMilestonePlan> generateBulkPlan({
+    required AiProvider provider,
+    required String openRouterKey,
+    required String ollamaBaseUrl,
+    required String model,
+    required String task,
+    required List<String> milestones,
+    required String approachTitle,
+    required List<String> milestoneStrategies,
+    required Map<String, dynamic> screenContext,
+    required String uiContext,
+    String? screenshotPath,
+    String tavilyKey = '',
+    String webMode = 'auto',
+    List<Map<String, dynamic>> attachments = const [],
+  }) async {
+    assert(milestones.length >= 2, 'Bulk planning requires at least 2 milestones');
+    _validateKeys(provider, openRouterKey, model);
+
+    final webContext = await _maybeWebContext(
+      tavilyKey: tavilyKey,
+      webMode: webMode,
+      task: task,
+    );
+    final attachmentSummary = _formatAttachments(attachments);
+    final hasScreenshot = screenshotPath != null;
+
+    final milestonesBlock = StringBuffer();
+    for (var i = 0; i < milestones.length; i++) {
+      final strategy = i < milestoneStrategies.length
+          ? milestoneStrategies[i]
+          : milestones[i];
+      milestonesBlock.writeln(
+        '  ${i + 1}. ${milestones[i]}  —  Strategy: $strategy',
+      );
+    }
+
+    final systemPrompt =
+        '''You are a desktop automation agent. You receive a structured list of UI elements parsed from the accessibility tree of the target application.${hasScreenshot ? ' A screenshot is also attached for visual reference.' : ''} Use the element list as your primary source of truth for planning actions.
+
+## Screen info
+${jsonEncode(screenContext)}
+Element coordinates are in screen pixels matching this region. No scaling needed.
+
+${_actionsBlock()}
+
+## MANDATORY: Element-based clicking
+- For milestone 1, step 1: use element_id from the UI element list below (IDs are current).
+- For later steps in milestone 1: use match_role and match_label (the UI will change after earlier steps execute, so current IDs become stale).
+- For milestones 2+: use ONLY match_role and match_label for ALL steps.
+- Milestone 1 match_label: use the FULL label text from the element list to uniquely identify the target. Example: "Commit to main" not "Commit".
+- Milestones 2+ match_label: use the most distinctive keyword or phrase you EXPECT to appear after the previous milestone completes. Prefer role-specific terms (e.g., "Save" for a Button, "Message" for a TextArea) over generic words. You cannot see these labels yet, so choose recognizable, stable terms.
+- ALWAYS provide match_role together with match_label for maximum precision.
+- NEVER invent pixel coordinates.
+- CRITICAL: Verify you select the correct element TYPE. A "Button" and a "TextArea" with similar names are NOT the same. To click a button, select the element with role=Button. To type in a field, select the TextArea/TextField/ComboBox. Read each element's role carefully before choosing.
+
+${_thenBlock()}
+
+${_verifyBlock()}
+
+${_hierarchyBlock()}
+
+${_safetyBlock()}
+
+## Bulk milestone planning mode
+- Plan steps for ALL milestones listed below in a SINGLE response.
+- Each milestone MUST have its own steps array and completion_contract.
+- Milestone 1 plans from the CURRENT UI state (use element_id for step 1 only).
+- Milestones 2+ plan from the EXPECTED UI state after the previous milestone completes.
+  Use match_role / match_label exclusively for these milestones.
+- Keep later milestone plans concise — focus on the essential actions. The system will
+  automatically replan from the live UI if the expected state does not match reality.
+- If a milestone is expected to already be complete after the previous milestone, return
+  it with "steps": [].
+- Use the selected approach and per-milestone strategies below.
+- Return [] for any milestone that would be a no-op.
+
+## UI state transition reasoning
+- For milestones 2+, mentally simulate what the screen will look like AFTER the previous milestone's completion_contract is satisfied.
+- Base your match_role/match_label choices on what SHOULD be visible at that point, not what is visible now.
+- Think through the expected navigation flow: if milestone 1 opens a dialog, milestone 2 should plan from within that dialog. If milestone 1 navigates to a new page, milestone 2 should reference elements expected on that page.
+- If you are unsure what elements will be present, use broad match_label values (a recognizable keyword rather than a full label) so the runtime matcher has a better chance of finding the target.
+
+## Completion contracts
+- Each milestone MUST include a completion_contract with a meaningful primary criterion.
+- Milestone 1: use specific criteria based on the current UI element list (e.g., text_visible with an exact label fragment).
+- Milestones 2+: completion_contract.primary should check for the OUTCOME of that milestone (e.g., text_visible for a confirmation message, element_gone for a dismissed dialog) rather than checking for UI elements that may not exist yet.
+- Set requires_llm_if_unclear: true for milestones 2+ since the expected UI is speculative.
+- Set recommend_screenshot_on_ambiguity: true for the FINAL milestone.
+
+## Plan quality expectations
+- Your plan quality naturally decreases for later milestones since you cannot see their UI state. This is expected and acceptable.
+- Focus your precision on milestone 1 (which has real UI context) and keep later milestones as simple and robust as possible.
+- The system will automatically validate each milestone's plan against the live UI before execution and replan any milestone whose UI doesn't match.
+- Prefer fewer, more robust steps over many fragile ones for later milestones.
+
+## Approach: $approachTitle
+
+## Milestones and strategies (plan ALL of these):
+$milestonesBlock
+
+${uiContext.isNotEmpty ? '\n$uiContext\n' : ''}
+## Response format — return ONLY valid JSON:
+{
+  "milestone_plans": [
+    {
+      "milestone": "milestone 1 title",
+      "steps": [
+        {"id":"m1_step_1","title":"...","action":"click","args":{"element_id":N,...},"verify":{"type":"...","role":"...","label_contains":"..."}}
+      ],
+      "completion_contract": {
+        "primary": {"type":"text_visible","label_contains":"..."},
+        "secondary": [],
+        "requires_llm_if_unclear": true,
+        "recommend_screenshot_on_ambiguity": false
+      }
+    },
+    {
+      "milestone": "milestone 2 title",
+      "steps": [
+        {"id":"m2_step_1","title":"...","action":"click","args":{"match_role":"Button","match_label":"..."},"verify":{"type":"...","label_contains":"..."}}
+      ],
+      "completion_contract": {...}
+    }
+  ]
+}
+
+IMPORTANT:
+- The "milestone_plans" array MUST contain exactly ${milestones.length} entries, one per milestone, in order.
+- Prefix step IDs with milestone number: m1_step_1, m2_step_1, etc.
+- Return ONLY the JSON object. No markdown fences, no explanation.''';
+
+    final userPrompt =
+        '''Task: $task
+
+Attachments: ${attachmentSummary.isEmpty ? '[none]' : attachmentSummary}
+${webContext.isNotEmpty ? '\n$webContext' : ''}
+
+Plan steps for ALL ${milestones.length} milestones using approach "$approachTitle".
+Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then produce the JSON object containing "milestone_plans" with one entry per milestone.''';
+
+    final raw = await _callPlannerRaw(
+      openRouterKey: openRouterKey,
+      ollamaBaseUrl: ollamaBaseUrl,
+      provider: provider,
+      model: model,
+      systemPrompt: systemPrompt,
+      userPrompt: userPrompt,
+      screenshotPath: screenshotPath,
+      label: 'generateBulkPlan',
+      uiContext: uiContext,
+    );
+    final result = _parseBulkMilestonePlan(raw, milestones);
+    if (result == null) {
+      throw FormatException(
+        'Failed to parse bulk plan response '
+        '(raw length=${raw.length}, milestones=${milestones.length})',
+      );
+    }
+    return result;
+  }
+
+  /// Parses the LLM response for [generateBulkPlan].
+  ///
+  /// Expects a JSON object with a "milestone_plans" array.  Each element is
+  /// parsed as a [MilestonePlan].  If the array is shorter than [milestones],
+  /// the missing entries are filled with `null` (caller falls back to
+  /// per-milestone planning for those).
+  static BulkMilestonePlan? _parseBulkMilestonePlan(
+    String raw,
+    List<String> milestones,
+  ) {
+    final rootObject = _extractJsonObject(raw);
+    if (rootObject == null) return null;
+
+    final plansRaw = rootObject['milestone_plans'];
+    if (plansRaw is! List || plansRaw.isEmpty) return null;
+
+    final plans = List<MilestonePlan?>.filled(milestones.length, null);
+    for (var i = 0; i < plansRaw.length && i < milestones.length; i++) {
+      final entry = plansRaw[i];
+      if (entry is! Map<String, dynamic>) continue;
+
+      final stepsRaw = entry['steps'];
+      final steps = stepsRaw is List
+          ? stepsRaw
+                .whereType<Map<String, dynamic>>()
+                .map(PlannedStep.fromJson)
+                .toList()
+          : const <PlannedStep>[];
+
+      final contract = entry['completion_contract'] is Map<String, dynamic>
+          ? CompletionContract.fromJson(
+              entry['completion_contract'] as Map<String, dynamic>,
+            )
+          : CompletionContract(
+              primary: _defaultCompletionCriteria(milestones[i]),
+            );
+
+      plans[i] = MilestonePlan(steps: steps, completionContract: contract);
+    }
+
+    // Require at least the first milestone to be parsed successfully.
+    if (plans[0] == null) return null;
+
+    return BulkMilestonePlan(milestonePlans: plans);
+  }
+
+  // -----------------------------------------------------------------------
   // replanFromFailure — called when a verification criterion fails.
   // -----------------------------------------------------------------------
 
   Future<MilestonePlan> replanFromFailure({
+    required AiProvider provider,
     required String openRouterKey,
+    required String ollamaBaseUrl,
     required String model,
     required String task,
     required List<String> milestones,
@@ -400,7 +642,7 @@ Analyze the UI elements${hasScreenshot ? ' and attached screenshot' : ''}, then 
     required List<PlannedStep> remainingSteps,
     String? screenshotPath,
   }) async {
-    _validateKeys(openRouterKey, model);
+    _validateKeys(provider, openRouterKey, model);
     final currentMilestone = milestones[milestoneIndex];
     final completedMilestonesText = completedMilestones.isEmpty
         ? '[none]'
@@ -495,6 +737,8 @@ Look at the current UI elements${screenshotPath != null ? ' and attached screens
 
     final raw = await _callPlannerRaw(
       openRouterKey: openRouterKey,
+      ollamaBaseUrl: ollamaBaseUrl,
+      provider: provider,
       model: model,
       systemPrompt: systemPrompt,
       userPrompt: userPrompt,
@@ -510,7 +754,9 @@ Look at the current UI elements${screenshotPath != null ? ' and attached screens
   }
 
   Future<bool> checkMilestoneCompletion({
+    required AiProvider provider,
     required String openRouterKey,
+    required String ollamaBaseUrl,
     required String model,
     required String task,
     required List<String> milestones,
@@ -522,7 +768,7 @@ Look at the current UI elements${screenshotPath != null ? ' and attached screens
     required String uiContext,
     String? screenshotPath,
   }) async {
-    _validateKeys(openRouterKey, model);
+    _validateKeys(provider, openRouterKey, model);
 
     final currentMilestone = milestones[milestoneIndex];
     final completedMilestonesText = completedMilestones.isEmpty
@@ -578,8 +824,10 @@ Determine whether the current milestone is already complete from the current UI 
     final responseBuffer = StringBuffer();
     final reasoningBuffer = StringBuffer();
     _reasoningLogger?.call('checkMilestoneCompletion', '', false);
-    await for (final chunk in _openRouter.chatCompletionStream(
-      apiKey: openRouterKey,
+    await for (final chunk in _chatCompletionStream(
+      provider: provider,
+      openRouterKey: openRouterKey,
+      ollamaBaseUrl: ollamaBaseUrl,
       model: model,
       messages: requestMessages,
     )) {
@@ -599,8 +847,10 @@ Determine whether the current milestone is already complete from the current UI 
     var raw = responseBuffer.toString();
     var reasoning = reasoningBuffer.toString();
     if (raw.trim().isEmpty) {
-      final completion = await _openRouter.chatCompletionDetailed(
-        apiKey: openRouterKey,
+      final completion = await _chatCompletionDetailed(
+        provider: provider,
+        openRouterKey: openRouterKey,
+        ollamaBaseUrl: ollamaBaseUrl,
         model: model,
         messages: requestMessages,
         includeReasoning: true,
@@ -636,7 +886,9 @@ Determine whether the current milestone is already complete from the current UI 
   // -----------------------------------------------------------------------
 
   Future<String> _callPlannerRaw({
+    required AiProvider provider,
     required String openRouterKey,
+    required String ollamaBaseUrl,
     required String model,
     required String systemPrompt,
     required String userPrompt,
@@ -665,8 +917,10 @@ Determine whether the current milestone is already complete from the current UI 
     final responseBuffer = StringBuffer();
     final reasoningBuffer = StringBuffer();
     _reasoningLogger?.call(label, '', false);
-    await for (final chunk in _openRouter.chatCompletionStream(
-      apiKey: openRouterKey,
+    await for (final chunk in _chatCompletionStream(
+      provider: provider,
+      openRouterKey: openRouterKey,
+      ollamaBaseUrl: ollamaBaseUrl,
       model: model,
       messages: requestMessages,
     )) {
@@ -683,8 +937,10 @@ Determine whether the current milestone is already complete from the current UI 
     var reasoning = reasoningBuffer.toString();
     // Fallback for providers/models that don't return SSE deltas reliably.
     if (raw.trim().isEmpty) {
-      final completion = await _openRouter.chatCompletionDetailed(
-        apiKey: openRouterKey,
+      final completion = await _chatCompletionDetailed(
+        provider: provider,
+        openRouterKey: openRouterKey,
+        ollamaBaseUrl: ollamaBaseUrl,
         model: model,
         messages: requestMessages,
         includeReasoning: true,
@@ -718,8 +974,55 @@ Determine whether the current milestone is already complete from the current UI 
   // Helpers
   // -----------------------------------------------------------------------
 
-  void _validateKeys(String openRouterKey, String model) {
-    validateOpenRouterConfig(apiKey: openRouterKey, model: model);
+  void _validateKeys(AiProvider provider, String openRouterKey, String model) {
+    if (provider == AiProvider.openrouter) {
+      validateOpenRouterConfig(apiKey: openRouterKey, model: model);
+    }
+  }
+
+  Stream<LlmStreamChunk> _chatCompletionStream({
+    required AiProvider provider,
+    required String openRouterKey,
+    required String ollamaBaseUrl,
+    required String model,
+    required List<Map<String, dynamic>> messages,
+  }) {
+    return switch (provider) {
+      AiProvider.openrouter => _openRouter.chatCompletionStream(
+          apiKey: openRouterKey,
+          model: model,
+          messages: messages,
+        ),
+      AiProvider.ollama => _ollama.chatCompletionStream(
+          baseUrl: ollamaBaseUrl,
+          model: model,
+          messages: messages,
+        ),
+    };
+  }
+
+  Future<LlmCompletion> _chatCompletionDetailed({
+    required AiProvider provider,
+    required String openRouterKey,
+    required String ollamaBaseUrl,
+    required String model,
+    required List<Map<String, dynamic>> messages,
+    required bool includeReasoning,
+  }) {
+    return switch (provider) {
+      AiProvider.openrouter => _openRouter.chatCompletionDetailed(
+          apiKey: openRouterKey,
+          model: model,
+          messages: messages,
+          includeReasoning: includeReasoning,
+        ),
+      AiProvider.ollama => _ollama.chatCompletionDetailed(
+          baseUrl: ollamaBaseUrl,
+          model: model,
+          messages: messages,
+          includeReasoning: includeReasoning,
+        ),
+    };
   }
 
   String _formatAttachments(List<Map<String, dynamic>> attachments) {
